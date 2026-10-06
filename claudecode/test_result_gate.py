@@ -85,6 +85,12 @@ class TestEvaluateReviewCompleted:
         path = _write(tmp_path, {'findings': [], 'analysis_summary': {'review_completed': 'true'}})
         assert evaluate(path, '0') == (False, 'review not completed')
 
+    @pytest.mark.parametrize('value', [1, 1.0], ids=['int_1', 'float_1'])
+    def test_review_completed_number_one(self, tmp_path, value):
+        """1 == True in Python; only the boolean true counts as a completed review."""
+        path = _write(tmp_path, {'findings': [], 'analysis_summary': {'review_completed': value}})
+        assert evaluate(path, '0') == (False, 'review not completed')
+
 
 class TestEvaluateExitCode:
     """Exit code rules for a valid, complete results file."""

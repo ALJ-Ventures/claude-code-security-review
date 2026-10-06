@@ -88,10 +88,96 @@ function addReactionsToReview(reviewId) {
   }
 }
 
+// Marker line that identifies the findings summary comment of one scanned head
+function summaryMarker(headSha) {
+  return `<!-- claude-code-security-review:summary head=${headSha} -->`;
+}
+
+// Severity, file and title are model output the scanned PR can influence. Neutralize them before
+// they enter the summary markdown: no HTML (the leading marker stays the only "<!--"), no code-span
+// breakout, no @mention pings, one line per finding.
+function sanitizeSummaryField(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/`/g, "'")
+    .replace(/@/g, '@\u200B')
+    .replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ')
+    .trim();
+}
+
+// Short title for one finding in the summary comment (raw; sanitized where the body is built)
+function summaryTitle(finding) {
+  let title = '';
+  if (typeof finding.title === 'string' && finding.title.trim() !== '') {
+    title = finding.title.trim();
+  } else if (typeof finding.description === 'string') {
+    title = finding.description.split('\n')[0].trim();
+  }
+  return (title || 'Security vulnerability detected').slice(0, 200);
+}
+
+function buildSummaryBody(findings, headSha) {
+  const lines = findings.map(finding => {
+    // Resolved exactly as the inline comments resolve them, then neutralized
+    const severity = sanitizeSummaryField(finding.severity || 'HIGH');
+    const file = sanitizeSummaryField(finding.file || finding.path);
+    const rawLine = Number(finding.line || finding.start?.line || 1);
+    const line = Number.isFinite(rawLine) ? rawLine : 1;
+    const title = sanitizeSummaryField(summaryTitle(finding)) || 'Security vulnerability detected';
+    return `- **${severity}** · \`${file}:${line}\` · ${title}`;
+  });
+  return [
+    summaryMarker(headSha),
+    `**ClaudeCode security scan — ${findings.length} finding(s) on head \`${headSha}\`**`,
+    '',
+    ...lines
+  ].join('\n');
+}
+
+// Post (or, on a re-run of the same head, update) one top-level PR comment that lists all
+// findings of the scanned head. Issue comments on a PR need only the pull-requests: write
+// permission the consumer already grants. Any failure here throws: the caller fails closed.
+function upsertFindingsSummary(findings) {
+  const headSha = context.payload.pull_request?.head?.sha;
+  if (!headSha) {
+    throw new Error('Pull request head SHA missing from the event payload');
+  }
+  const marker = summaryMarker(headSha);
+  const body = buildSummaryBody(findings, headSha);
+  const repoPath = `/repos/${context.repo.owner}/${context.repo.repo}`;
+
+  let existing = null;
+  for (let page = 1; page <= 20 && !existing; page++) {
+    const comments = ghApi(`${repoPath}/issues/${context.issue.number}/comments?per_page=100&page=${page}`);
+    if (!Array.isArray(comments)) {
+      throw new Error(`Unexpected response listing PR comments (page ${page})`);
+    }
+    // Our summary bodies start with the marker; matching only at the start keeps a marker
+    // quoted inside another comment (or inside a finding text) from being taken for it.
+    existing = comments.find(comment =>
+      comment && comment.user && comment.user.type === 'Bot' &&
+      typeof comment.body === 'string' && comment.body.startsWith(marker)
+    ) || null;
+    if (comments.length < 100) {
+      break;
+    }
+  }
+
+  if (existing) {
+    ghApi(`${repoPath}/issues/comments/${existing.id}`, 'PATCH', { body });
+    console.log(`Updated findings summary comment ${existing.id} for head ${headSha} (${findings.length} finding(s))`);
+  } else {
+    ghApi(`${repoPath}/issues/${context.issue.number}/comments`, 'POST', { body });
+    console.log(`Created findings summary comment for head ${headSha} (${findings.length} finding(s))`);
+  }
+}
+
 async function run() {
+  let newFindings = [];
   try {
     // Read the findings
-    let newFindings = [];
     try {
       const findingsData = fs.readFileSync('findings.json', 'utf8');
       newFindings = JSON.parse(findingsData);
@@ -104,6 +190,25 @@ async function run() {
       return;
     }
     
+    // Check if ClaudeCode comments should be silenced (no comments at all, summary included)
+    const silenceClaudeCodeComments = process.env.SILENCE_CLAUDECODE_COMMENTS === 'true';
+    
+    if (silenceClaudeCodeComments) {
+      console.log(`ClaudeCode comments silenced - excluding ${newFindings.length} findings from comments`);
+      return;
+    }
+    
+    // The summary comment goes first and fails closed: without it the PR may not show this head's findings
+    upsertFindingsSummary(newFindings);
+  } catch (error) {
+    console.error('Failed to comment on PR:', error);
+    process.exit(1);
+    return;
+  }
+  
+  // Inline review comments: best effort once the summary stands. An error here is logged
+  // and does not fail the step.
+  try {
     // Get the PR diff to map file lines to diff positions
     const prFiles = ghApi(`/repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issue.number}/files?per_page=100`);
     
@@ -115,15 +220,6 @@ async function run() {
     
     // Prepare review comments
     const reviewComments = [];
-    
-    // Check if ClaudeCode comments should be silenced
-    const silenceClaudeCodeComments = process.env.SILENCE_CLAUDECODE_COMMENTS === 'true';
-    
-    if (silenceClaudeCodeComments) {
-      console.log(`ClaudeCode comments silenced - excluding ${newFindings.length} findings from comments`);
-      return;
-    }
-    
     
     // Process findings synchronously (gh cli doesn't support async well)
     for (const finding of newFindings) {
@@ -173,7 +269,7 @@ async function run() {
       return;
     }
     
-    // Check for existing review comments to avoid duplicates
+    // Check for existing review comments to avoid duplicates (suppresses inline comments only, never the summary)
     const comments = ghApi(`/repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issue.number}/comments`);
     
     // Check if we've already commented on these findings
@@ -239,8 +335,7 @@ async function run() {
       }
     }
   } catch (error) {
-    console.error('Failed to comment on PR:', error);
-    process.exit(1);
+    console.error('Failed to post inline review comments (the findings summary comment stands):', error);
   }
 }
 

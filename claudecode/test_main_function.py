@@ -567,7 +567,10 @@ class TestAuditFailureModes:
         {'files_reviewed': 0, 'review_completed': False},
         {'files_reviewed': 3},
         None,
-    ], ids=['review_completed_false', 'review_completed_missing', 'analysis_summary_missing'])
+        {'files_reviewed': 3, 'review_completed': 1},
+        {'files_reviewed': 3, 'review_completed': 1.0},
+    ], ids=['review_completed_false', 'review_completed_missing', 'analysis_summary_missing',
+            'review_completed_int_1', 'review_completed_float_1'])
     @patch('pathlib.Path.cwd')
     @patch('claudecode.github_action_audit.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
