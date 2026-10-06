@@ -254,6 +254,94 @@ class TestSimpleClaudeRunner:
         assert mock_run.call_count == 2
     
     @patch('subprocess.run')
+    def test_run_security_audit_is_error_result_fails(self, mock_run):
+        """A result with is_error true is a failed audit, not an empty one."""
+        error_result = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "API Error: 401 authentication_error"
+        }
+        mock_run.return_value = Mock(returncode=0, stdout=json.dumps(error_result), stderr='')
+        
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(
+                Path('/tmp/test'),
+                "test prompt"
+            )
+        
+        assert success is False
+        assert error == "Claude Code reported an error (subtype: success)"
+        assert results == {}
+        assert mock_run.call_count == 1
+    
+    @patch('subprocess.run')
+    def test_run_security_audit_error_max_turns_fails(self, mock_run):
+        """error_max_turns is a failed audit."""
+        error_result = {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": True
+        }
+        mock_run.return_value = Mock(returncode=0, stdout=json.dumps(error_result), stderr='')
+        
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(
+                Path('/tmp/test'),
+                "test prompt"
+            )
+        
+        assert success is False
+        assert error == "Claude Code reported an error (subtype: error_max_turns)"
+        assert results == {}
+    
+    @patch('subprocess.run')
+    def test_run_security_audit_error_during_execution_fails_after_retry(self, mock_run):
+        """error_during_execution is retried once at attempt 0, then fails."""
+        error_result = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True
+        }
+        mock_run.return_value = Mock(returncode=0, stdout=json.dumps(error_result), stderr='')
+        
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(
+                Path('/tmp/test'),
+                "test prompt"
+            )
+        
+        assert success is False
+        assert error == "Claude Code reported an error (subtype: error_during_execution)"
+        assert results == {}
+        assert mock_run.call_count == 2
+    
+    @patch('subprocess.run')
+    def test_run_security_audit_prompt_too_long_still_detected(self, mock_run):
+        """The "Prompt is too long" branch runs before the generic is_error check."""
+        error_result = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "result": "Prompt is too long"
+        }
+        mock_run.return_value = Mock(returncode=0, stdout=json.dumps(error_result), stderr='')
+        
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(
+                Path('/tmp/test'),
+                "test prompt"
+            )
+        
+        assert success is False
+        assert error == "PROMPT_TOO_LONG"
+        assert results == {}
+    
+    @patch('subprocess.run')
     def test_run_security_audit_timeout(self, mock_run):
         """Test timeout handling."""
         mock_run.side_effect = subprocess.TimeoutExpired(['claude'], 1200)

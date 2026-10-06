@@ -270,6 +270,12 @@ class SimpleClaudeRunner:
                         attempt == 0):
                         continue  # Retry
                     
+                    # Any other error result is a failed audit, never an empty one
+                    if (isinstance(parsed_result, dict) and
+                        parsed_result.get('type') == 'result' and
+                        parsed_result.get('is_error')):
+                        return False, f"Claude Code reported an error (subtype: {parsed_result.get('subtype')})", {}
+                    
                     # Extract security findings
                     parsed_results = self._extract_security_findings(parsed_result)
                     return True, "", parsed_results
@@ -596,6 +602,12 @@ def main():
         
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
+            sys.exit(EXIT_GENERAL_ERROR)
+        
+        # An audit that did not complete must never be reported as 0 findings
+        audit_summary = results.get('analysis_summary', {})
+        if not isinstance(audit_summary, dict) or audit_summary.get('review_completed') is not True:
+            print(json.dumps({'error': 'Security audit incomplete: analysis_summary.review_completed is not true'}))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # Filter findings to reduce false positives
