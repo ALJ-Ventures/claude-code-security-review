@@ -239,7 +239,8 @@ class TestMainFunction:
                     'files_reviewed': 5,
                     'high_severity': 0,
                     'medium_severity': 0,
-                    'low_severity': 0
+                    'low_severity': 0,
+                    'review_completed': True
                 }
             }
         )
@@ -324,7 +325,8 @@ class TestMainFunction:
                     'files_reviewed': 2,
                     'high_severity': 1,
                     'medium_severity': 1,
-                    'low_severity': 0
+                    'low_severity': 0,
+                    'review_completed': True
                 }
             }
         )
@@ -391,7 +393,9 @@ class TestMainFunction:
         
         mock_runner = Mock()
         mock_runner.validate_claude_available.return_value = (True, "")
-        mock_runner.run_security_audit.return_value = (True, "", {'findings': findings})
+        mock_runner.run_security_audit.return_value = (
+            True, "", {'findings': findings, 'analysis_summary': {'review_completed': True}}
+        )
         mock_runner_class.return_value = mock_runner
         
         mock_prompt_func.return_value = "prompt"
@@ -452,7 +456,9 @@ class TestMainFunction:
         
         mock_runner = Mock()
         mock_runner.validate_claude_available.return_value = (True, "")
-        mock_runner.run_security_audit.return_value = (True, "", {'findings': findings})
+        mock_runner.run_security_audit.return_value = (
+            True, "", {'findings': findings, 'analysis_summary': {'review_completed': True}}
+        )
         mock_runner_class.return_value = mock_runner
         
         mock_prompt_func.return_value = "prompt"
@@ -556,3 +562,61 @@ class TestAuditFailureModes:
             output = json.loads(captured.out)
             assert 'Security audit failed' in output['error']
             assert 'Claude execution failed' in output['error']
+    
+    @pytest.mark.parametrize('analysis_summary', [
+        {'files_reviewed': 0, 'review_completed': False},
+        {'files_reviewed': 3},
+        None,
+        {'files_reviewed': 3, 'review_completed': 1},
+        {'files_reviewed': 3, 'review_completed': 1.0},
+    ], ids=['review_completed_false', 'review_completed_missing', 'analysis_summary_missing',
+            'review_completed_int_1', 'review_completed_float_1'])
+    @patch('pathlib.Path.cwd')
+    @patch('claudecode.github_action_audit.get_security_audit_prompt')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_audit_incomplete(self, mock_client_class, mock_runner_class,
+                              mock_filter_class, mock_prompt_func,
+                              mock_cwd, analysis_summary, capsys):
+        """An audit that did not complete is an error, never 0 findings."""
+        mock_client = Mock()
+        mock_client.get_pr_data.return_value = {'number': 123, 'title': 'Test', 'body': ''}
+        mock_client.get_pr_diff.return_value = "diff"
+        mock_client_class.return_value = mock_client
+        
+        audit_results = {'findings': []}
+        if analysis_summary is not None:
+            audit_results['analysis_summary'] = analysis_summary
+        
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner.run_security_audit.return_value = (True, "", audit_results)
+        mock_runner_class.return_value = mock_runner
+        
+        mock_filter = Mock()
+        mock_filter.filter_findings.return_value = (
+            True,
+            {'filtered_findings': [], 'excluded_findings': [], 'analysis_summary': {}},
+            Mock()  # filter_stats
+        )
+        mock_filter_class.return_value = mock_filter
+        mock_prompt_func.return_value = "prompt"
+        mock_cwd.return_value = Path('/tmp')
+        
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+            
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert output == {
+                'error': 'Security audit incomplete: analysis_summary.review_completed is not true'
+            }
+            mock_filter.filter_findings.assert_not_called()
