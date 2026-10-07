@@ -276,18 +276,32 @@ runs:
           echo "findings_count=$GATE_RESULT" >> $GITHUB_OUTPUT
           echo "ClaudeCode found $GATE_RESULT security issues"
           
-          # Also create findings.json for PR comment script
-          jq '.findings // []' claudecode/claudecode-results.json > findings.json || echo '[]' > findings.json
+          # Also create findings.json for PR comment script (a jq error is never turned into 0 findings)
+          if ! jq '.findings // []' claudecode/claudecode-results.json > findings.json; then
+            echo "::error::Security scan failed: findings could not be extracted for the PR comment. A failed hand-over is never reported as 0 findings."
+            rm -f findings.json
+            SCAN_FAILED="true"
+          fi
         else
           echo "::error::Security scan failed: $GATE_RESULT. A failed scan is never reported as 0 findings."
           SCAN_FAILED="true"
         fi
-        
-        # Always copy files to workspace root regardless of the outcome
-        # This ensures artifact upload and PR commenting can find them
-        if [ -f findings.json ]; then
-          cp findings.json ${{ github.workspace }}/findings.json || true
+
+        # Hand-over to the PR comment step (fail closed): after a passed gate findings.json must
+        # reach the workspace root. Skip the copy when the action runs from the workspace itself.
+        if [ "$SCAN_FAILED" != "true" ]; then
+          if [ ! -f findings.json ]; then
+            echo "::error::Security scan failed: findings file missing after a completed scan."
+            SCAN_FAILED="true"
+          elif ! { [ findings.json -ef "${{ github.workspace }}/findings.json" ] || cp findings.json "${{ github.workspace }}/findings.json"; }; then
+            echo "::error::Security scan failed: findings file could not be copied for the PR comment."
+            rm -f findings.json "${{ github.workspace }}/findings.json"
+            SCAN_FAILED="true"
+          fi
         fi
+
+        # Always copy the diagnosis files to workspace root regardless of the outcome
+        # This ensures artifact upload can find them
         if [ -f claudecode/claudecode-results.json ]; then
           cp claudecode/claudecode-results.json ${{ github.workspace }}/claudecode-results.json || true
         fi

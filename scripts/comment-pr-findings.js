@@ -174,18 +174,42 @@ function upsertFindingsSummary(findings) {
   }
 }
 
+// Hand-over from the scan step (fail closed): findings.json must hold exactly as many findings as
+// the result gate counted (CLAUDECODE_FINDINGS). Otherwise a finding the scan reported could vanish
+// on a green job. Errors name the reason and counts only, never finding content.
+function readHandedOverFindings() {
+  const rawCount = process.env.CLAUDECODE_FINDINGS;
+  if (typeof rawCount !== 'string' || !/^[0-9]+$/.test(rawCount)) {
+    throw new Error('Findings hand-over failed: findings count from the result gate is missing or not a non-negative integer');
+  }
+  const expectedCount = Number(rawCount);
+
+  let findingsData;
+  try {
+    findingsData = fs.readFileSync('findings.json', 'utf8');
+  } catch (e) {
+    throw new Error('Findings hand-over failed: findings file missing or unreadable');
+  }
+  let findings;
+  try {
+    findings = JSON.parse(findingsData);
+  } catch (e) {
+    throw new Error('Findings hand-over failed: findings file is not valid JSON');
+  }
+  if (!Array.isArray(findings)) {
+    throw new Error('Findings hand-over failed: findings file does not hold an array');
+  }
+  if (findings.length !== expectedCount) {
+    throw new Error(`Findings hand-over failed: findings file holds ${findings.length} finding(s), the result gate counted ${expectedCount}`);
+  }
+  return findings;
+}
+
 async function run() {
   let newFindings = [];
   try {
-    // Read the findings
-    try {
-      const findingsData = fs.readFileSync('findings.json', 'utf8');
-      newFindings = JSON.parse(findingsData);
-    } catch (e) {
-      console.log('Could not read findings file');
-      return;
-    }
-    
+    newFindings = readHandedOverFindings();
+
     if (newFindings.length === 0) {
       return;
     }

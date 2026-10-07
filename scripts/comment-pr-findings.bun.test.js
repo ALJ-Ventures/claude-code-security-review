@@ -92,7 +92,9 @@ describe('comment-pr-findings.js', () => {
   });
 
   describe('Finding Processing', () => {
-    test('should exit early when no findings file exists', async () => {
+    test('should fail closed when no findings file exists', async () => {
+      process.env.CLAUDECODE_FINDINGS = '1';
+      processExitSpy.mockClear(); // Bun spies keep calls across tests
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
           return JSON.stringify({
@@ -111,11 +113,12 @@ describe('comment-pr-findings.js', () => {
 
       await import('./comment-pr-findings.js');
       
-      expect(consoleLogSpy).toHaveBeenCalledWith('Could not read findings file');
+      expect(processExitSpy).toHaveBeenCalledWith(1);
       expect(spawnSyncSpy).not.toHaveBeenCalled();
     });
 
     test('should exit early when findings array is empty', async () => {
+      process.env.CLAUDECODE_FINDINGS = '0';
       readFileSyncSpy.mockReturnValue('[]');
 
       await import('./comment-pr-findings.js');
@@ -133,6 +136,7 @@ describe('comment-pr-findings.js', () => {
           fix: 'json.loads($DATA)  # Use json.loads() instead of pickle for security'
         }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       const mockPrFiles = [{
         filename: 'test.py',
@@ -210,6 +214,7 @@ describe('comment-pr-findings.js', () => {
           fix: 'json.loads($DATA)  # Use json.loads() instead of pickle for security'
         }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
@@ -269,6 +274,7 @@ describe('comment-pr-findings.js', () => {
           fix: 'yaml.safe_load($DATA)'
         }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
@@ -328,6 +334,7 @@ describe('comment-pr-findings.js', () => {
           fix: 'json.loads($DATA)  # Use json.loads() instead of pickle for security'
         }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
@@ -394,6 +401,7 @@ describe('comment-pr-findings.js', () => {
           }
         });
       }
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       const mockPrFiles = mockFindings.map(f => ({
         filename: f.file,
@@ -458,6 +466,7 @@ describe('comment-pr-findings.js', () => {
           check_id: 'pickle-insecure-usage'
         }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       const mockPrFiles = [{
         filename: 'test.py',
@@ -517,6 +526,7 @@ describe('comment-pr-findings.js', () => {
 
   describe('Error Handling', () => {
     test('should handle GitHub API errors gracefully', async () => {
+      process.env.CLAUDECODE_FINDINGS = '1';
      
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
@@ -562,6 +572,7 @@ describe('comment-pr-findings.js', () => {
         check_id: 'rules.insecure-pickle-loads-autofix',
         extra: { message: 'Test', fix: 'test' }
       }];
+      process.env.CLAUDECODE_FINDINGS = String(mockFindings.length);
 
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
@@ -607,6 +618,7 @@ describe('comment-pr-findings.js', () => {
     });
 
     function givenEvent(headSha, findings) {
+      process.env.CLAUDECODE_FINDINGS = String(findings.length); // the count the result gate hands over
       readFileSyncSpy.mockImplementation((path) => {
         if (path.includes('github-event.json')) {
           return JSON.stringify({ pull_request: { number: 123, head: { sha: headSha } } });
@@ -880,6 +892,126 @@ describe('comment-pr-findings.js', () => {
         const body = calls.find(isSummaryPost).input.body;
         expect(body.split('\n')[3]).toBe('- **HIGH &lt;img src=x onerror=alert(1)&gt;** · `app.py:1` · T &amp;lt; U');
       });
+    });
+  });
+
+  describe('Findings hand-over from the scan step (fail closed)', () => {
+    const HEAD = '3333333333333333333333333333333333333333';
+    const LEAK = 'LEAK_MARKER_F1';
+    const failedExit = () => processExitSpy.mock.calls.some(([code]) => code !== undefined && code !== 0);
+    const errorOutput = () => consoleErrorSpy.mock.calls.flat()
+      .map((arg) => (arg instanceof Error ? `${arg.message}\n${arg.stack}` : String(arg)))
+      .join('\n');
+
+    beforeEach(() => {
+      // Bun spies keep their calls across tests; these assertions need a clean slate.
+      processExitSpy.mockClear();
+      consoleErrorSpy.mockClear();
+      spawnSyncSpy.mockClear();
+      spawnSyncSpy.mockImplementation(() => ({ status: 0, stdout: '[]', stderr: '' }));
+    });
+
+    // count: the CLAUDECODE_FINDINGS value (undefined = not set); file: the findings.json content (null = missing)
+    function givenHandOver(count, file) {
+      if (count === undefined) {
+        delete process.env.CLAUDECODE_FINDINGS;
+      } else {
+        process.env.CLAUDECODE_FINDINGS = count;
+      }
+      readFileSyncSpy.mockImplementation((path) => {
+        if (path.includes('github-event.json')) {
+          return JSON.stringify({ pull_request: { number: 123, head: { sha: HEAD } } });
+        }
+        if (path === 'findings.json') {
+          if (file === null) {
+            throw new Error("ENOENT: no such file or directory, open 'findings.json'");
+          }
+          return file;
+        }
+        throw new Error('Unexpected file read: ' + path);
+      });
+    }
+
+    const oneFinding = JSON.stringify([{ file: 'app.py', line: 7, severity: 'HIGH', title: LEAK }]);
+
+    test('(a) count 1 and the findings file missing: non-zero exit, no gh call', async () => {
+      givenHandOver('1', null);
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+    });
+
+    test('(b) count 1 and invalid JSON: non-zero exit, no gh call, no file content in the log', async () => {
+      givenHandOver('1', `[{"file": "app.py", "title": "${LEAK}"`);
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+      expect(errorOutput()).not.toContain(LEAK);
+    });
+
+    test('(c) count 1 and an empty array: non-zero exit, no gh call', async () => {
+      givenHandOver('1', '[]');
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+    });
+
+    test('(d) count 2 and an array with one entry: non-zero exit, no gh call, counts but no finding content in the log', async () => {
+      givenHandOver('2', oneFinding);
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+      expect(errorOutput()).toContain('1');
+      expect(errorOutput()).toContain('2');
+      expect(errorOutput()).not.toContain(LEAK);
+    });
+
+    test('a findings file that holds no array: non-zero exit, no gh call', async () => {
+      givenHandOver('1', JSON.stringify({ findings: [{ title: LEAK }] }));
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+      expect(errorOutput()).not.toContain(LEAK);
+    });
+
+    for (const [label, count] of [['missing', undefined], ['empty', ''], ['abc', 'abc'], ['-1', '-1']]) {
+      test(`(e) count ${label}: non-zero exit, no gh call`, async () => {
+        givenHandOver(count, oneFinding);
+
+        await import('./comment-pr-findings.js');
+
+        expect(failedExit()).toBe(true);
+        expect(spawnSyncSpy).not.toHaveBeenCalled();
+      });
+    }
+
+    test('(f) count 0 and an empty array: exit 0, no gh call', async () => {
+      givenHandOver('0', '[]');
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(false);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
+    });
+
+    test('the hand-over check runs before the silence branch', async () => {
+      process.env.SILENCE_CLAUDECODE_COMMENTS = 'true';
+      givenHandOver('1', '[]');
+
+      await import('./comment-pr-findings.js');
+
+      expect(failedExit()).toBe(true);
+      expect(spawnSyncSpy).not.toHaveBeenCalled();
     });
   });
 });
