@@ -1,0 +1,5 @@
+# Exact versions for the direct dependencies in requirements.txt, used by CI and by the
+# action at runtime (pip -c). Rule: newest release at least 14 days old when pinned.
+# Transitive dependencies stay open on purpose.
+requests==2.34.2
+anthropic==1.11.0
