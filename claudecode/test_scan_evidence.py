@@ -959,35 +959,65 @@ class TestGateWithAndWithoutEvidence:
 
 ACTION_YML = Path(__file__).resolve().parent.parent / 'action.yml'
 
+# The scan step writes its stderr log straight to the workspace root; GitHub expands this expression
+# (inside double quotes in the script) before bash runs, so the test expands it the same way.
+WORKSPACE_EXPR = '${{ github.workspace }}'
+ERROR_LOG_EXPR = '"' + WORKSPACE_EXPR + '/claudecode-error.log"'
 
-def echo_block():
+
+def echo_block(workspace):
     """The evidence echo of the scan step, dedented to a standalone shell snippet."""
     text = ACTION_YML.read_text(encoding='utf-8')
     start = text.index('        # Run and input evidence')
     end = text.index('        fi\n', start) + len('        fi\n')
-    return '\n'.join(line[8:] for line in text[start:end].splitlines()) + '\n'
+    block = '\n'.join(line[8:] for line in text[start:end].splitlines()) + '\n'
+    return block.replace(WORKSPACE_EXPR, str(workspace))
 
 
 class TestActionEvidenceEcho:
     def test_echo_sits_between_the_scan_and_the_result_gate(self):
         text = ACTION_YML.read_text(encoding='utf-8')
         python_call = text.index('python -u claudecode/github_action_audit.py')
-        echo = text.index("grep '^SCAN-EVIDENCE ' claudecode/claudecode-error.log || true")
+        echo = text.index(f"grep '^SCAN-EVIDENCE ' {ERROR_LOG_EXPR} || true")
         gate_block = text.index('# Result gate (fail closed)')
         assert python_call < echo < gate_block
         # only the echo is allowed to swallow a failure; the gate call and the scan call stay strict
         assert 'result_gate claudecode/claudecode-results.json "${CLAUDECODE_EXIT_CODE:-0}")' in text
         assert 'result_gate' not in text[echo - 200:echo + 200]
 
+    def test_error_log_is_written_at_the_workspace_root_from_the_start(self):
+        # a job timeout cancels the step before any end-of-step copy runs, so the log must not need one
+        text = ACTION_YML.read_text(encoding='utf-8')
+        python_line = next(line for line in text.splitlines() if 'python -u claudecode/github_action_audit.py' in line)
+        assert f'2>{ERROR_LOG_EXPR} ||' in python_line
+        assert 'claudecode/claudecode-error.log' not in text  # no reference to a log under the action dir
+        assert 'cp claudecode/claudecode-error.log' not in text  # and no end-of-step copy of it
+
+    def test_echo_prints_outside_any_log_group(self):
+        text = ACTION_YML.read_text(encoding='utf-8')
+        python_call = text.index('python -u claudecode/github_action_audit.py')
+        echo = text.index(f"grep '^SCAN-EVIDENCE ' {ERROR_LOG_EXPR} || true")
+        gate_block = text.index('# Result gate (fail closed)')
+        before = text[python_call:echo]
+        # the group opened for the scan is closed before the echo, so the Actions UI does not collapse it
+        assert '::endgroup::' in before and '::group::' not in before
+        # the gate keeps its place in the (re-opened) group
+        assert text.index('::group::', echo) < gate_block
+
     @pytest.mark.skipif(shutil.which('bash') is None, reason='bash not available')
     def test_echo_prints_only_evidence_lines_and_never_fails_the_step(self, tmp_path):
-        (tmp_path / 'claudecode').mkdir()
-        log = tmp_path / 'claudecode' / 'claudecode-error.log'
+        # workspace and action dir differ, as in a normal run (the step cd's into the action dir);
+        # the workspace path holds a space to prove the quoting
+        workspace = tmp_path / 'work space'
+        action_dir = tmp_path / 'action'
+        workspace.mkdir()
+        action_dir.mkdir()
+        log = workspace / 'claudecode-error.log'
 
         def run():
             # the same shell flags GitHub uses for `shell: bash`
-            return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', echo_block()],
-                                  cwd=tmp_path, capture_output=True, text=True)
+            return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', echo_block(workspace)],
+                                  cwd=action_dir, capture_output=True, text=True)
 
         log.write_text('[Info] something\nSCAN-EVIDENCE attempt=1 pr=42\n'
                        '[mod] SCAN-EVIDENCE not=at-column-zero\nSCAN-EVIDENCE attempt=2 pr=42\n', encoding='utf-8')
