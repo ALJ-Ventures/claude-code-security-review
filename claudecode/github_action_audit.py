@@ -387,6 +387,21 @@ def _is_prompt_too_long(cli_result: Any) -> bool:
     return any(PROMPT_TOO_LONG_PHRASE in text.lower() for text in texts)
 
 
+def _strict_cli_result(stdout: Any) -> Optional[Dict[str, Any]]:
+    """The CLI result object of a failing Claude Code run, or None if stdout is not exactly that.
+
+    Strict on purpose: stdout is parsed as one JSON document with no fallback extraction from
+    surrounding text, and neither the text nor the parse error is logged or returned. A failing
+    run's stdout is not trusted output; only a complete JSON object is read, a decode error or
+    any other JSON value counts as "no valid result".
+    """
+    try:
+        parsed = json.loads(stdout)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 class SimpleClaudeRunner:
     """Simplified Claude Code runner for GitHub Actions."""
     
@@ -478,7 +493,13 @@ class SimpleClaudeRunner:
                     # Read stdout as JSON first, whatever the exit code: Claude Code can report an
                     # over-long prompt together with a failing exit code. That is not a crash to
                     # repeat three times; main() runs the attempt without the diff on it instead.
-                    success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
+                    # On a failing exit only a strictly parsed result object counts: no fallback
+                    # extraction, and the raw stdout is never logged.
+                    if result.returncode == 0:
+                        success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
+                    else:
+                        parsed_result = _strict_cli_result(result.stdout)
+                        success = parsed_result is not None
                     if success and _is_prompt_too_long(parsed_result):
                         attempt_state['cli_result'] = parsed_result
                         return False, "PROMPT_TOO_LONG", {}
