@@ -93,6 +93,16 @@ class GitHubActionClient:
             files_data.extend(page_files)
             if len(page_files) < self.FILES_PER_PAGE:
                 break
+        else:
+            # No short page: page FILES_MAX_PAGES was full, so the list stopped at the API cap, not
+            # at the end of the PR. A PR with more changed files than the cap has files this scan
+            # would never see, and a partial list must not pass as complete.
+            if pr_data['changed_files'] > len(files_data):
+                raise AuditError(
+                    f"PR has {pr_data['changed_files']} changed files, but the GitHub API lists at most "
+                    f"{len(files_data)} (cap of {self.FILES_MAX_PAGES} pages of {self.FILES_PER_PAGE}); "
+                    f"the file list would be incomplete"
+                )
         
         return {
             'number': pr_data['number'],

@@ -412,9 +412,32 @@ class TestGitHubAPIIntegration:
         page_2.json.assert_not_called()
 
     @patch('requests.get')
-    def test_file_list_stops_after_page_30(self, mock_get):
-        """The list-files endpoint returns at most 3,000 files: 30 full pages, no page 31 request."""
+    def test_file_list_stops_after_page_30_and_fails_when_the_pr_has_more_files(self, mock_get):
+        """The list-files endpoint returns at most 3,000 files: no page 31 request, and a PR with
+        more changed files than that fails closed instead of being scanned on a partial list."""
         pr_response = make_pr_response(changed_files=3200)
+        mock_get.side_effect = [pr_response] + [
+            make_files_page(make_file_entries(n * 100, 100)) for n in range(30)
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(ValueError) as exc_info:
+                client.get_pr_data('owner/repo', 123)
+
+        message = str(exc_info.value)
+        assert '3200' in message and '3000' in message
+        assert 'file0.py' not in message  # counts only, no file names
+
+        file_page_urls = [u for u in requested_urls(mock_get) if '/files?' in u]
+        assert file_page_urls == [FILES_URL.format(page=n) for n in range(1, 31)]
+        assert FILES_URL.format(page=31) not in file_page_urls
+        assert mock_get.call_count == 31  # PR metadata + 30 file pages
+
+    @patch('requests.get')
+    def test_exactly_3000_files_load_at_the_cap_without_error(self, mock_get):
+        """A PR with exactly 3,000 changed files fills 30 pages and is complete: all 3,000 returned."""
+        pr_response = make_pr_response(changed_files=3000)
         mock_get.side_effect = [pr_response] + [
             make_files_page(make_file_entries(n * 100, 100)) for n in range(30)
         ]
@@ -425,11 +448,46 @@ class TestGitHubAPIIntegration:
 
         file_page_urls = [u for u in requested_urls(mock_get) if '/files?' in u]
         assert file_page_urls == [FILES_URL.format(page=n) for n in range(1, 31)]
-        assert FILES_URL.format(page=31) not in file_page_urls
         assert mock_get.call_count == 31  # PR metadata + 30 file pages
         assert len(result['files']) == 3000
         assert result['files'][0]['filename'] == 'file0.py'
         assert result['files'][2999]['filename'] == 'file2999.py'
+        assert result['changed_files'] == 3000
+
+    @patch('requests.get')
+    def test_cap_check_counts_files_before_directory_exclusion(self, mock_get):
+        """At the cap, completeness compares changed_files with the files the API listed, not with
+        what is left after directory exclusion: excluding files does not turn a complete list into a failure."""
+        pages = [make_file_entries(n * 100, 100) for n in range(30)]
+        for entry in pages[4]:
+            entry['filename'] = 'vendor/' + entry['filename']
+        mock_get.side_effect = [make_pr_response(changed_files=3000)] + [
+            make_files_page(entries) for entries in pages
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token', 'EXCLUDE_DIRECTORIES': 'vendor'}):
+            client = GitHubActionClient()
+            result = client.get_pr_data('owner/repo', 123)
+
+        assert len(result['files']) == 2900
+        assert result['changed_files'] == 3000
+
+    @patch('requests.get')
+    def test_short_page_below_changed_files_does_not_fail(self, mock_get):
+        """The completeness check applies only when the 3,000-file cap was reached: a short last
+        page ends the list, whatever changed_files says."""
+        mock_get.side_effect = [
+            make_pr_response(changed_files=500),
+            make_files_page(make_file_entries(0, 100)),
+            make_files_page(make_file_entries(100, 20)),
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            result = client.get_pr_data('owner/repo', 123)
+
+        assert len(result['files']) == 120
+        assert result['changed_files'] == 500
 
     @patch('requests.get')
     def test_excluded_directories_apply_to_the_collected_list(self, mock_get):
