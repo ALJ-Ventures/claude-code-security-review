@@ -12,6 +12,12 @@ from pathlib import Path
 from claudecode.github_action_audit import main
 
 
+# action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
+@pytest.fixture(autouse=True)
+def isolate_claude_timeout(monkeypatch):
+    monkeypatch.delenv('CLAUDE_TIMEOUT', raising=False)
+
+
 class TestMainFunction:
     """Test main function execution flow."""
     

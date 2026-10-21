@@ -21,6 +21,13 @@ from claudecode import result_gate
 from claudecode.constants import DEFAULT_CLAUDE_MODEL
 from claudecode.github_action_audit import SimpleClaudeRunner, main
 
+
+# action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
+@pytest.fixture(autouse=True)
+def isolate_claude_timeout(monkeypatch):
+    monkeypatch.delenv('CLAUDE_TIMEOUT', raising=False)
+
+
 PREFIX = 'SCAN-EVIDENCE '
 
 # Key order of the log line contract (a trailing `reading=not-proven` only when diff=no)
