@@ -71,6 +71,16 @@ runs:
           fi
         done
 
+    - name: Prepare the action's work directory
+      shell: bash
+      run: |
+        # Everything the action writes or uploads (results, findings.json, error log, run marker) lives in this
+        # one directory under the runner temp dir. The workspace is the pull request's checkout (in the self-scan
+        # the action path is too), so a link committed there could redirect a write or an upload. Removed and
+        # created on every run, so nothing of an earlier job on the same runner is read or uploaded.
+        rm -rf "${{ runner.temp }}/claude-code-security-review"
+        mkdir -p "${{ runner.temp }}/claude-code-security-review"
+
     - name: Set up Python
       uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0 pinned to commit hash
       with:
@@ -81,7 +91,7 @@ runs:
       if: github.event_name == 'pull_request'
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
       with:
-        path: .claudecode-marker
+        path: ${{ runner.temp }}/claude-code-security-review/claudecode-marker
         key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
         restore-keys: |
           claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
@@ -104,10 +114,10 @@ runs:
 
           # Now check cache - if ClaudeCode has already run, disable unless run-every-commit is true
           # Check if marker file exists (cache may have been restored from a different SHA)
-          if [ "$RUN_EVERY_COMMIT" != "true" ] && [ -f ".claudecode-marker/marker.json" ]; then
+          if [ "$RUN_EVERY_COMMIT" != "true" ] && [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-marker/marker.json" ]; then
             echo "ClaudeCode has already run on PR #$PR_NUMBER (found marker file), forcing disable to avoid false positives"
             ENABLE_CLAUDECODE="false"
-          elif [ "$RUN_EVERY_COMMIT" == "true" ] && [ -f ".claudecode-marker/marker.json" ]; then
+          elif [ "$RUN_EVERY_COMMIT" == "true" ] && [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-marker/marker.json" ]; then
             echo "ClaudeCode has already run on PR #$PR_NUMBER but run-every-commit is enabled, running again"
           elif [ "$ENABLE_CLAUDECODE" == "true" ]; then
             echo "ClaudeCode will run for PR #$PR_NUMBER (first run)"
@@ -135,8 +145,8 @@ runs:
         RUN_NUMBER: ${{ github.run_number }}
       run: |
         # Create a reservation marker immediately to prevent other concurrent runs
-        mkdir -p .claudecode-marker
-        cat > .claudecode-marker/marker.json << EOF
+        mkdir -p "${{ runner.temp }}/claude-code-security-review/claudecode-marker"
+        cat > "${{ runner.temp }}/claude-code-security-review/claudecode-marker/marker.json" << EOF
         {
           "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
           "repository_id": "$REPOSITORY_ID",
@@ -184,12 +194,14 @@ runs:
         CLAUDE_MODEL: ${{ inputs.claude-model }}
         CLAUDECODE_TIMEOUT: ${{ inputs.claudecode-timeout }}
         ACTION_PATH: ${{ github.action_path }}
+        # No __pycache__ next to the modules: in the self-scan (uses: ./) the action path is the PR checkout
+        PYTHONDONTWRITEBYTECODE: '1'
       run: |
         echo "Running ClaudeCode AI security analysis..."
         echo "----------------------------------------"
         
         # Initialize outputs (findings_count is written only by the result gate below)
-        echo "results_file=claudecode/claudecode-results.json" >> $GITHUB_OUTPUT
+        echo "results_file=${{ runner.temp }}/claude-code-security-review/claudecode-results.json" >> $GITHUB_OUTPUT
         
         # Skip ClaudeCode if not a PR
         if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -233,10 +245,10 @@ runs:
         echo "Updated PYTHONPATH: $PYTHONPATH"
         
         # Run from the action root directory so Python can find the claudecode module
-        # The stderr log is written from the start to the runner temp dir: it survives a job cancelled
-        # mid-scan, and it stays out of the scanned workspace, so a retry never reads an earlier
-        # attempt's diagnostics. A step before the upload copies it to the workspace root.
-        python -u claudecode/github_action_audit.py > claudecode/claudecode-results.json 2>"${{ runner.temp }}/claudecode-error.log" || CLAUDECODE_EXIT_CODE=$?
+        # Results and stderr log go to the work directory from the start: the log survives a job cancelled
+        # mid-scan (the upload step reads it there), and neither file sits in the scanned workspace, so a
+        # retry never reads an earlier attempt's output.
+        python -u claudecode/github_action_audit.py > "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" 2>"${{ runner.temp }}/claude-code-security-review/claudecode-error.log" || CLAUDECODE_EXIT_CODE=$?
         
         if [ -n "$CLAUDECODE_EXIT_CODE" ]; then
           echo "::warning::ClaudeCode exited with code $CLAUDECODE_EXIT_CODE"
@@ -246,52 +258,52 @@ runs:
         echo "::endgroup::"
         
         # Run and input evidence: one line per Claude Code attempt (counts, enums, SHAs and timings only)
-        if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
-          grep '^SCAN-EVIDENCE ' "${{ runner.temp }}/claudecode-error.log" || true
+        if [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-error.log" ]; then
+          grep '^SCAN-EVIDENCE ' "${{ runner.temp }}/claude-code-security-review/claudecode-error.log" || true
         fi
         
         echo "::group::ClaudeCode Results"
         # Parse ClaudeCode results regardless of exit code (the result gate below counts findings)
-        if [ -f claudecode/claudecode-results.json ]; then
-          FILE_SIZE=$(wc -c < claudecode/claudecode-results.json)
+        if [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" ]; then
+          FILE_SIZE=$(wc -c < "${{ runner.temp }}/claude-code-security-review/claudecode-results.json")
           echo "ClaudeCode results file size: $FILE_SIZE bytes"
           
           # Check if file is empty or too small
           if [ "$FILE_SIZE" -lt 2 ]; then
             echo "::warning::ClaudeCode results file is empty or invalid (size: $FILE_SIZE bytes)"
             echo "::warning::ClaudeCode may have failed silently. Check claudecode-error.log"
-            if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
+            if [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-error.log" ]; then
               echo "Error log contents:"
-              cat "${{ runner.temp }}/claudecode-error.log"
+              cat "${{ runner.temp }}/claude-code-security-review/claudecode-error.log"
             fi
           else
             echo "ClaudeCode results preview:"
-            head -n 300 claudecode/claudecode-results.json || echo "Unable to preview results"
+            head -n 300 "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" || echo "Unable to preview results"
                         
             # Check if the result is an error
-            if jq -e '.error' claudecode/claudecode-results.json > /dev/null 2>&1; then
-              ERROR_MSG=$(jq -r '.error' claudecode/claudecode-results.json)
+            if jq -e '.error' "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" > /dev/null 2>&1; then
+              ERROR_MSG=$(jq -r '.error' "${{ runner.temp }}/claude-code-security-review/claudecode-results.json")
               echo "::warning::ClaudeCode error: $ERROR_MSG"
             fi
           fi
         else
           echo "::warning::ClaudeCode results file not found"
-          if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
+          if [ -f "${{ runner.temp }}/claude-code-security-review/claudecode-error.log" ]; then
             echo "Error log contents:"
-            cat "${{ runner.temp }}/claudecode-error.log"
+            cat "${{ runner.temp }}/claude-code-security-review/claudecode-error.log"
           fi
         fi
         
         # Result gate (fail closed): only a complete, error-free scan yields a findings count
         SCAN_FAILED="false"
-        if GATE_RESULT=$(python -m claudecode.result_gate claudecode/claudecode-results.json "${CLAUDECODE_EXIT_CODE:-0}"); then
+        if GATE_RESULT=$(python -m claudecode.result_gate "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" "${CLAUDECODE_EXIT_CODE:-0}"); then
           echo "findings_count=$GATE_RESULT" >> $GITHUB_OUTPUT
           echo "ClaudeCode found $GATE_RESULT security issues"
           
           # Also create findings.json for PR comment script (a jq error is never turned into 0 findings)
-          if ! jq '.findings // []' claudecode/claudecode-results.json > findings.json; then
+          if ! jq '.findings // []' "${{ runner.temp }}/claude-code-security-review/claudecode-results.json" > "${{ runner.temp }}/claude-code-security-review/findings.json"; then
             echo "::error::Security scan failed: findings could not be extracted for the PR comment. A failed hand-over is never reported as 0 findings."
-            rm -f findings.json
+            rm -f "${{ runner.temp }}/claude-code-security-review/findings.json"
             SCAN_FAILED="true"
           fi
         else
@@ -299,23 +311,13 @@ runs:
           SCAN_FAILED="true"
         fi
 
-        # Hand-over to the PR comment step (fail closed): after a passed gate findings.json must
-        # reach the workspace root. Skip the copy when the action runs from the workspace itself.
+        # Hand-over to the PR comment step (fail closed): after a passed gate findings.json must exist in
+        # the work directory, where the comment step runs. Nothing is copied into the workspace.
         if [ "$SCAN_FAILED" != "true" ]; then
-          if [ ! -f findings.json ]; then
+          if [ ! -f "${{ runner.temp }}/claude-code-security-review/findings.json" ]; then
             echo "::error::Security scan failed: findings file missing after a completed scan."
             SCAN_FAILED="true"
-          elif ! { [ findings.json -ef "${{ github.workspace }}/findings.json" ] || cp findings.json "${{ github.workspace }}/findings.json"; }; then
-            echo "::error::Security scan failed: findings file could not be copied for the PR comment."
-            rm -f findings.json "${{ github.workspace }}/findings.json"
-            SCAN_FAILED="true"
           fi
-        fi
-
-        # Always copy the results file to workspace root regardless of the outcome
-        # This ensures artifact upload can find it (the error log is copied by its own step below)
-        if [ -f claudecode/claudecode-results.json ]; then
-          cp claudecode/claudecode-results.json ${{ github.workspace }}/claudecode-results.json || true
         fi
         
         echo "::endgroup::"
@@ -329,34 +331,28 @@ runs:
       if: steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request' && steps.claudecode-scan.outcome == 'success'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
       with:
-        path: .claudecode-marker
+        path: ${{ runner.temp }}/claude-code-security-review/claudecode-marker
         key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
     
-    # The live scan log sits in the runner temp dir (outside the scanned workspace); the upload step reads
-    # claudecode-error.log at the workspace root, so it is copied there once the scan is over, killed or not
-    - name: Stage scan log for upload
-      if: always() && inputs.upload-results == 'true'
-      shell: bash
-      run: |
-        if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
-          cp "${{ runner.temp }}/claudecode-error.log" "${{ github.workspace }}/claudecode-error.log"
-        fi
-    
+    # Uploads only from the work directory. All three files sit in that one directory, so the artifact stays
+    # flat with the same three names; a log of a scan killed mid-run is uploaded too.
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 pinned to commit hash
       with:
         name: security-review-results
         path: |
-          findings.json
-          claudecode-results.json
-          claudecode-error.log
+          ${{ runner.temp }}/claude-code-security-review/findings.json
+          ${{ runner.temp }}/claude-code-security-review/claudecode-results.json
+          ${{ runner.temp }}/claude-code-security-review/claudecode-error.log
         retention-days: 7
         if-no-files-found: ignore
     
     - name: Comment PR with findings
       if: github.event_name == 'pull_request' && inputs.comment-pr == 'true' && steps.claudecode-check.outputs.enable_claudecode == 'true'
       shell: bash
+      # comment-pr-findings.js reads findings.json from its working directory
+      working-directory: ${{ runner.temp }}/claude-code-security-review
       env:
         GITHUB_TOKEN: ${{ github.token }}
         CLAUDECODE_FINDINGS: ${{ steps.claudecode-scan.outputs.findings_count }}
