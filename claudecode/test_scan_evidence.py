@@ -96,6 +96,17 @@ def proc(result=None, returncode=0, stdout=None, stderr=''):
     return Mock(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+TOO_LONG_DETAIL = 'Prompt is too long · this conversation is a single exchange and cannot be compacted'
+
+# Claude Code results that report an over-long prompt, in the three shapes it emits
+TOO_LONG_VARIANTS = {
+    'exact-text': cli_result(is_error=True, result='Prompt is too long'),
+    'text-with-detail': cli_result(is_error=True, result=TOO_LONG_DETAIL),
+    'text-in-errors': cli_result(subtype='error_during_execution', is_error=True,
+                                 errors=['Prompt is too long'], drop=('result',)),
+}
+
+
 def evidence_lines(text):
     return [line for line in text.splitlines() if line.startswith(PREFIX)]
 
@@ -225,6 +236,25 @@ class TestRunnerEvidence:
         assert values['is_error'] == 'true'
         assert values['turns'] == '17'
         assert values['review_completed'] == 'unknown'
+
+    @pytest.mark.parametrize('exit_code', [0, 1])
+    @pytest.mark.parametrize('variant', list(TOO_LONG_VARIANTS))
+    def test_prompt_too_long_attempt_is_one_entry_that_carries_the_result(self, variant, exit_code, capsys):
+        # the early PROMPT_TOO_LONG return still records its attempt, with how the run ended
+        stdout = json.dumps(TOO_LONG_VARIANTS[variant])
+        (success, error, results), lines, runner = run_runner(
+            [proc(stdout=stdout, returncode=exit_code)], capsys=capsys)
+
+        assert (success, error, results) == (False, 'PROMPT_TOO_LONG', {})
+        assert len(lines) == 1
+        values = dict(parse_line(lines[0]))
+        assert values['attempt'] == '1'
+        assert values['exit'] == str(exit_code)
+        assert values['type'] == 'result'
+        assert values['subtype'] == TOO_LONG_VARIANTS[variant]['subtype']
+        assert values['is_error'] == 'true'
+        assert values['review_completed'] == 'unknown'
+        assert [e['attempt'] for e in runner.scan_evidence()['attempts']] == [1]
 
     def test_error_during_execution_then_success(self, capsys):
         first = cli_result(subtype='error_during_execution', is_error=True, drop=('result',),
@@ -656,6 +686,53 @@ class TestMainEvidence:
         assert parse_line(lines[1])[-1] == ('reading', 'not-proven')
         assert mock_run.call_count == 3  # version check + two claude calls
         assert gate(tmp_path, output, code) == (True, '0')
+
+    @pytest.mark.parametrize('exit_code', [0, 1])
+    @pytest.mark.parametrize('variant', list(TOO_LONG_VARIANTS))
+    def test_prompt_too_long_with_any_exit_code_runs_the_no_diff_attempt(self, variant, exit_code,
+                                                                         tmp_path, capsys):
+        calls = [proc(TOO_LONG_VARIANTS[variant], returncode=exit_code), proc(cli_result())]
+        code, output, err, mock_run = run_main_capture(capsys, tmp_path, calls)
+
+        assert code == 0  # the no-diff attempt completed: the scan completes
+        attempts = output['scan_evidence']['attempts']
+        assert [a['attempt'] for a in attempts] == [1, 2]  # both attempts are in the evidence
+        first, second = attempts
+        assert (first['diff'], second['diff']) == ('yes', 'no')
+        assert 'reading' not in first
+        assert second['reading'] == 'not-proven'
+        assert (first['exit'], second['exit']) == (exit_code, 0)
+        assert first['type'] == 'result' and first['is_error'] is True
+        assert first['review_completed'] == 'unknown'
+        assert second['review_completed'] is True
+        assert second['prompt_chars'] < first['prompt_chars']
+
+        lines = evidence_lines(err)
+        assert len(lines) == 2
+        assert parse_line(lines[1])[-1] == ('reading', 'not-proven')
+        assert mock_run.call_count == 3  # version check + the attempt with the diff + the one without
+        assert gate(tmp_path, output, code) == (True, '0')
+
+    @pytest.mark.parametrize('exit_code', [0, 1])
+    @pytest.mark.parametrize('result', [
+        cli_result(is_error=True, result='API Error: 401 authentication_error'),
+        cli_result(subtype='error_during_execution', is_error=True, errors=['API Error: 529 overloaded_error'],
+                   drop=('result',)),
+        cli_result(is_error=False, result='Prompt is too long'),
+        cli_result(type='assistant', is_error=True, result='Prompt is too long'),
+    ], ids=['other-error', 'other-error-in-errors', 'phrase-without-error-flag', 'phrase-but-not-a-result'])
+    def test_other_results_never_give_a_successful_scan_or_a_no_diff_attempt(self, result, exit_code,
+                                                                            tmp_path, capsys):
+        calls = [proc(result, returncode=exit_code) for _ in range(3)]
+        code, output, err, mock_run = run_main_capture(capsys, tmp_path, calls)
+
+        assert code == 1  # a failed scan, never a clean one
+        assert 'error' in output and 'findings' not in output
+        assert 'PROMPT_TOO_LONG' not in output['error']
+        assert gate(tmp_path, output, code) == (False, 'scan reported an error')
+        attempts = output['scan_evidence']['attempts']
+        assert all(a['diff'] == 'yes' and 'reading' not in a for a in attempts)  # no run without the diff
+        assert 'Prompt too long, retrying without diff' not in err
 
     def test_empty_diff_means_no_diff_in_prompt(self, tmp_path, capsys):
         code, output, err, _ = run_main_capture(capsys, tmp_path, [proc(cli_result())], pr_diff='')

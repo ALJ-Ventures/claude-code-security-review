@@ -351,6 +351,32 @@ def _format_evidence_line(entry: Dict[str, Any]) -> str:
     return ' '.join([EVIDENCE_PREFIX] + [f'{key}={render(value)}' for key, value in entry.items()])
 
 
+PROMPT_TOO_LONG_PHRASE = 'prompt is too long'
+
+
+def _is_prompt_too_long(cli_result: Any) -> bool:
+    """True if a parsed Claude Code result is an error that reports an over-long prompt.
+
+    This is the one detection rule. It matches a result object (`type` is "result") with
+    `is_error` true whose `result` text, or any text entry of its `errors` list, contains
+    "prompt is too long" in any letter case. Claude Code words it in more than one way, for
+    example "Prompt is too long" or "Prompt is too long · ...", and puts it in `result` or in
+    `errors`. The exit code and `subtype` play no part. Every other result is not a match.
+    """
+    if not isinstance(cli_result, dict):
+        return False
+    if cli_result.get('type') != 'result' or cli_result.get('is_error') is not True:
+        return False
+    texts = []
+    result_text = cli_result.get('result')
+    if isinstance(result_text, str):
+        texts.append(result_text)
+    errors = cli_result.get('errors')
+    if isinstance(errors, list):
+        texts.extend(entry for entry in errors if isinstance(entry, str))
+    return any(PROMPT_TOO_LONG_PHRASE in text.lower() for text in texts)
+
+
 class SimpleClaudeRunner:
     """Simplified Claude Code runner for GitHub Actions."""
     
@@ -439,6 +465,14 @@ class SimpleClaudeRunner:
                     attempt_state['exit'] = result.returncode
                     attempt_state['stdout'] = result.stdout
                     
+                    # Read stdout as JSON first, whatever the exit code: Claude Code can report an
+                    # over-long prompt together with a failing exit code. That is not a crash to
+                    # repeat three times; main() runs the attempt without the diff on it instead.
+                    success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
+                    if success and _is_prompt_too_long(parsed_result):
+                        attempt_state['cli_result'] = parsed_result
+                        return False, "PROMPT_TOO_LONG", {}
+                    
                     if result.returncode != 0:
                         if attempt == NUM_RETRIES - 1:
                             error_details = f"Claude Code execution failed with return code {result.returncode}\n"
@@ -450,19 +484,8 @@ class SimpleClaudeRunner:
                             # Note: We don't do exponential backoff here to keep the runtime reasonable
                             continue  # Retry
                     
-                    # Parse JSON output
-                    success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
-                    
                     if success:
                         attempt_state['cli_result'] = parsed_result
-                        # Check for "Prompt is too long" error that should trigger retry without diff
-                        if (isinstance(parsed_result, dict) and 
-                            parsed_result.get('type') == 'result' and 
-                            parsed_result.get('subtype') == 'success' and
-                            parsed_result.get('is_error') and
-                            parsed_result.get('result') == 'Prompt is too long'):
-                            return False, "PROMPT_TOO_LONG", {}
-                        
                         # Check for error_during_execution that should trigger retry
                         if (isinstance(parsed_result, dict) and 
                             parsed_result.get('type') == 'result' and 
