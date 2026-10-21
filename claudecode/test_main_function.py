@@ -96,6 +96,26 @@ class TestMainFunction:
             output = json.loads(captured.out)
             assert 'Failed to initialize Claude runner' in output['error']
     
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_main_invalid_claude_timeout(self, mock_client_class, capsys):
+        """Test main fails closed with an error JSON when CLAUDE_TIMEOUT is invalid."""
+        mock_client_class.return_value = Mock()
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token',
+            'CLAUDE_TIMEOUT': '0'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 2  # EXIT_CONFIGURATION_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'CLAUDE_TIMEOUT' in output['error']
+
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')

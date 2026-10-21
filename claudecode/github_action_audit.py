@@ -617,20 +617,39 @@ def get_environment_config() -> Tuple[str, int]:
 
 def initialize_clients() -> Tuple[GitHubActionClient, SimpleClaudeRunner]:
     """Initialize GitHub and Claude clients.
+
+    CLAUDE_TIMEOUT (minutes, the claudecode-timeout input) sets the timeout of each Claude Code attempt;
+    unset or empty keeps the default.
     
     Returns:
         Tuple of (github_client, claude_runner)
         
     Raises:
-        ConfigurationError: If client initialization fails
+        ConfigurationError: If client initialization fails or CLAUDE_TIMEOUT is not a positive whole number
     """
+    timeout_value = os.environ.get('CLAUDE_TIMEOUT', '').strip()
+    timeout_minutes = None
+    if timeout_value:
+        # Fail closed: only a positive whole number of minutes is accepted (no sign, no decimal point)
+        try:
+            timeout_minutes = int(timeout_value) if re.fullmatch(r'[0-9]+', timeout_value) else 0
+        except ValueError:  # more digits than int() accepts
+            timeout_minutes = 0
+        if timeout_minutes < 1:
+            raise ConfigurationError(
+                f"CLAUDE_TIMEOUT must be a positive whole number of minutes, got '{timeout_value}'"
+            )
+
     try:
         github_client = GitHubActionClient()
     except Exception as e:
         raise ConfigurationError(f'Failed to initialize GitHub client: {str(e)}')
     
     try:
-        claude_runner = SimpleClaudeRunner()
+        if timeout_minutes is None:
+            claude_runner = SimpleClaudeRunner()
+        else:
+            claude_runner = SimpleClaudeRunner(timeout_minutes=timeout_minutes)
     except Exception as e:
         raise ConfigurationError(f'Failed to initialize Claude runner: {str(e)}')
         
