@@ -10,6 +10,7 @@ on:
 jobs:
   security-review:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     permissions:
       contents: read
       pull-requests: write
@@ -22,4 +23,5 @@ jobs:
           upload-results: true
           exclude-directories: "tests/vulnerable"
           claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
+          claude-model: claude-opus-5-5
           run-every-commit: true
