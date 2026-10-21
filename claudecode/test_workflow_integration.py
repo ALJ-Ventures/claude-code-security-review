@@ -407,8 +407,15 @@ class TestWorkflowEdgeCases:
             'changed_files': 500
         }
         
-        files_response = Mock()
-        files_response.json.return_value = large_files
+        # The files endpoint pages at 100 entries: five full pages, then an empty sixth
+        # page that confirms the list is complete.
+        file_pages = []
+        for start in range(0, 500, 100):
+            page_response = Mock()
+            page_response.json.return_value = large_files[start:start + 100]
+            file_pages.append(page_response)
+        empty_page = Mock()
+        empty_page.json.return_value = []
         
         # Create massive diff
         diff_parts = []
@@ -425,7 +432,7 @@ index 0000000..1234567
         diff_response = Mock()
         diff_response.text = '\n'.join(diff_parts)
         
-        mock_get.side_effect = [pr_response, files_response, diff_response]
+        mock_get.side_effect = [pr_response, *file_pages, empty_page, diff_response]
         
         # Claude handles it gracefully
         mock_run.side_effect = [

@@ -41,6 +41,10 @@ class AuditError(ValueError):
 class GitHubActionClient:
     """Simplified GitHub API client for GitHub Actions environment."""
     
+    # The list-files endpoint pages at 100 entries and returns at most 3,000 files (30 pages).
+    FILES_PER_PAGE = 100
+    FILES_MAX_PAGES = 30
+    
     def __init__(self):
         """Initialize GitHub client using environment variables."""
         self.github_token = os.environ.get('GITHUB_TOKEN')
@@ -75,11 +79,20 @@ class GitHubActionClient:
         response.raise_for_status()
         pr_data = response.json()
         
-        # Get PR files with pagination support
-        files_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files?per_page=100"
-        response = requests.get(files_url, headers=self.headers)
-        response.raise_for_status()
-        files_data = response.json()
+        # Get every page of the PR file list. A page that fails raises out of this method: a
+        # partial list must never pass as the complete one.
+        files_data = []
+        for page in range(1, self.FILES_MAX_PAGES + 1):
+            files_url = (
+                f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files"
+                f"?per_page={self.FILES_PER_PAGE}&page={page}"
+            )
+            response = requests.get(files_url, headers=self.headers)
+            response.raise_for_status()
+            page_files = response.json()
+            files_data.extend(page_files)
+            if len(page_files) < self.FILES_PER_PAGE:
+                break
         
         return {
             'number': pr_data['number'],

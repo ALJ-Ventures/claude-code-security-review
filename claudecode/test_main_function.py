@@ -208,7 +208,82 @@ class TestMainFunction:
             output = json.loads(captured.out)
             assert 'Failed to fetch PR data' in output['error']
             assert 'API error' in output['error']
-    
+
+    @patch('requests.get')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    def test_main_file_list_page_error_fails_the_run(self, mock_runner_class, mock_filter_class,
+                                                     mock_get, capsys):
+        """A failing page 2 of the PR file list ends the run with an error, never a findings result."""
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner_class.return_value = mock_runner
+        mock_filter_class.return_value = Mock()
+
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Large PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 2500,
+            'deletions': 0,
+            'changed_files': 250
+        }
+        page_1 = Mock()
+        page_1.json.return_value = [
+            {
+                'filename': f'file{i}.py',
+                'status': 'added',
+                'additions': 10,
+                'deletions': 0,
+                'changes': 10,
+                'patch': '@@ -0,0 +1 @@\n+x'
+            }
+            for i in range(100)
+        ]
+        page_2 = Mock()
+        page_2.raise_for_status.side_effect = Exception("502 Server Error: Bad Gateway")
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        # Routed by URL, so the run only fails if page 2 of the file list is requested and errors;
+        # an unpaged file-list request or a reordered call sequence cannot reach the same result.
+        responses = {
+            'https://api.github.com/repos/owner/repo/pulls/123': pr_response,
+            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=1': page_1,
+            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=2': page_2,
+        }
+
+        def route(url, headers=None, **kwargs):
+            if headers and headers.get('Accept') == 'application/vnd.github.diff':
+                return diff_response
+            return responses[url]
+
+        mock_get.side_effect = route
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'Failed to fetch PR data' in output['error']
+            assert '502 Server Error' in output['error']
+            assert 'findings' not in output
+            mock_runner.run_security_audit.assert_not_called()
+
     @patch('pathlib.Path.cwd')
     @patch('claudecode.github_action_audit.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')

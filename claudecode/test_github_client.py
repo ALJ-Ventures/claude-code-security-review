@@ -5,9 +5,60 @@ Unit tests for GitHubActionClient.
 
 import pytest
 import os
+import requests
 from unittest.mock import Mock, patch
 
 from claudecode.github_action_audit import GitHubActionClient
+
+
+FILES_URL = 'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page={page}'
+
+
+def make_pr_response(changed_files):
+    """Mock response for the PR metadata request."""
+    response = Mock()
+    response.json.return_value = {
+        'number': 123,
+        'title': 'Large PR',
+        'body': 'Many files',
+        'user': {'login': 'testuser'},
+        'created_at': '2024-01-01T00:00:00Z',
+        'updated_at': '2024-01-01T01:00:00Z',
+        'state': 'open',
+        'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+        'base': {'ref': 'main', 'sha': 'def456'},
+        'additions': changed_files * 10,
+        'deletions': 0,
+        'changed_files': changed_files
+    }
+    return response
+
+
+def make_file_entries(start, count):
+    """`count` file entries named file{start}.py .. file{start + count - 1}.py."""
+    return [
+        {
+            'filename': f'file{i}.py',
+            'status': 'added',
+            'additions': 10,
+            'deletions': 0,
+            'changes': 10,
+            'patch': f'@@ -0,0 +1,10 @@\n+# File {i}'
+        }
+        for i in range(start, start + count)
+    ]
+
+
+def make_files_page(entries):
+    """Mock response for one page of the PR file list."""
+    response = Mock()
+    response.json.return_value = entries
+    return response
+
+
+def requested_urls(mock_get):
+    """URLs of every requests.get call, in call order."""
+    return [call.args[0] for call in mock_get.call_args_list]
 
 
 class TestGitHubActionClient:
@@ -97,10 +148,10 @@ class TestGitHubActionClient:
             headers=client.headers
         )
         mock_get.assert_any_call(
-            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100',
+            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=1',
             headers=client.headers
         )
-        
+
         # Verify result structure
         assert result['number'] == 123
         assert result['title'] == 'Test PR'
@@ -294,46 +345,111 @@ class TestGitHubAPIIntegration:
                 client.get_pr_data('owner/repo', 123)
     
     @patch('requests.get')
-    def test_pagination_not_needed_for_pr_files(self, mock_get):
-        """Test that PR files endpoint returns all files without pagination."""
-        # GitHub API returns up to 3000 files per PR without pagination
-        large_file_list = [
-            {
-                'filename': f'file{i}.py',
-                'status': 'added',
-                'additions': 10,
-                'deletions': 0,
-                'changes': 10,
-                'patch': f'@@ -0,0 +1,10 @@\n+# File {i}'
-            }
-            for i in range(100)  # 100 files
-        ]
-        
-        pr_response = Mock()
-        pr_response.json.return_value = {
-            'number': 123,
-            'title': 'Large PR',
-            'body': 'Many files',
-            'user': {'login': 'testuser'},
-            'created_at': '2024-01-01T00:00:00Z',
-            'updated_at': '2024-01-01T01:00:00Z',
-            'state': 'open',
-            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
-            'base': {'ref': 'main', 'sha': 'def456'},
-            'additions': 1000,
-            'deletions': 0,
-            'changed_files': 100
-        }
-        
-        files_response = Mock()
-        files_response.json.return_value = large_file_list
-        
-        mock_get.side_effect = [pr_response, files_response]
-        
+    def test_exactly_100_files_requests_page_2_and_keeps_all_100(self, mock_get):
+        """A full first page of 100 files is not proof of completeness: page 2 is requested.
+
+        The files endpoint pages at 100 entries. Exactly 100 files on page 1 could be the
+        whole list or the first of several pages, so the client asks for page 2; here it
+        comes back empty and the result holds the 100 files.
+        """
+        large_file_list = make_file_entries(0, 100)
+
+        pr_response = make_pr_response(changed_files=100)
+        page_1 = make_files_page(large_file_list)
+        page_2 = make_files_page([])
+
+        mock_get.side_effect = [pr_response, page_1, page_2]
+
         with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
             client = GitHubActionClient()
             result = client.get_pr_data('owner/repo', 123)
-        
+
+        assert requested_urls(mock_get)[1:] == [FILES_URL.format(page=1), FILES_URL.format(page=2)]
+        page_2.raise_for_status.assert_called_once()
         assert len(result['files']) == 100
         assert result['files'][0]['filename'] == 'file0.py'
         assert result['files'][99]['filename'] == 'file99.py'
+
+    @patch('requests.get')
+    def test_250_files_load_over_three_pages_in_order(self, mock_get):
+        """250 files arrive as pages of 100, 100 and 50: all 250 in order, three file-page requests."""
+        pr_response = make_pr_response(changed_files=250)
+        mock_get.side_effect = [
+            pr_response,
+            make_files_page(make_file_entries(0, 100)),
+            make_files_page(make_file_entries(100, 100)),
+            make_files_page(make_file_entries(200, 50)),
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            result = client.get_pr_data('owner/repo', 123)
+
+        file_page_urls = [u for u in requested_urls(mock_get) if '/files?' in u]
+        assert file_page_urls == [FILES_URL.format(page=n) for n in (1, 2, 3)]
+        assert mock_get.call_count == 4  # PR metadata + three file pages
+        assert [f['filename'] for f in result['files']] == [f'file{i}.py' for i in range(250)]
+        assert result['changed_files'] == 250
+
+    @patch('requests.get')
+    def test_error_on_page_2_raises_without_partial_list(self, mock_get):
+        """A failing follow-up page raises out of get_pr_data; the first page is never returned alone."""
+        pr_response = make_pr_response(changed_files=250)
+        page_2 = Mock()
+        page_2.raise_for_status.side_effect = requests.HTTPError('500 Server Error: page 2')
+        mock_get.side_effect = [
+            pr_response,
+            make_files_page(make_file_entries(0, 100)),
+            page_2,
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(requests.HTTPError, match='page 2'):
+                client.get_pr_data('owner/repo', 123)
+
+        assert requested_urls(mock_get)[1:] == [FILES_URL.format(page=1), FILES_URL.format(page=2)]
+        page_2.json.assert_not_called()
+
+    @patch('requests.get')
+    def test_file_list_stops_after_page_30(self, mock_get):
+        """The list-files endpoint returns at most 3,000 files: 30 full pages, no page 31 request."""
+        pr_response = make_pr_response(changed_files=3200)
+        mock_get.side_effect = [pr_response] + [
+            make_files_page(make_file_entries(n * 100, 100)) for n in range(30)
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            result = client.get_pr_data('owner/repo', 123)
+
+        file_page_urls = [u for u in requested_urls(mock_get) if '/files?' in u]
+        assert file_page_urls == [FILES_URL.format(page=n) for n in range(1, 31)]
+        assert FILES_URL.format(page=31) not in file_page_urls
+        assert mock_get.call_count == 31  # PR metadata + 30 file pages
+        assert len(result['files']) == 3000
+        assert result['files'][0]['filename'] == 'file0.py'
+        assert result['files'][2999]['filename'] == 'file2999.py'
+
+    @patch('requests.get')
+    def test_excluded_directories_apply_to_the_collected_list(self, mock_get):
+        """Exclusion runs over every page: an excluded file on page 2 is dropped, the rest keep their order."""
+        entries = make_file_entries(0, 120)
+        entries[110]['filename'] = 'vendor/lib/skip.py'
+        mock_get.side_effect = [
+            make_pr_response(changed_files=120),
+            make_files_page(entries[:100]),
+            make_files_page(entries[100:]),
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token', 'EXCLUDE_DIRECTORIES': 'vendor'}):
+            client = GitHubActionClient()
+            result = client.get_pr_data('owner/repo', 123)
+
+        names = [f['filename'] for f in result['files']]
+        assert len(names) == 119
+        assert 'vendor/lib/skip.py' not in names
+        assert names[:100] == [f'file{i}.py' for i in range(100)]
+        assert set(result['files'][0]) == {
+            'filename', 'status', 'additions', 'deletions', 'changes', 'patch'
+        }
