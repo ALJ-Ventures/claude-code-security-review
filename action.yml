@@ -239,6 +239,11 @@ runs:
           echo "ClaudeCode scan completed successfully"
         fi
         
+        # Run and input evidence: one line per Claude Code attempt (counts, enums, SHAs and timings only)
+        if [ -f claudecode/claudecode-error.log ]; then
+          grep '^SCAN-EVIDENCE ' claudecode/claudecode-error.log || true
+        fi
+        
         # Parse ClaudeCode results regardless of exit code (the result gate below counts findings)
         if [ -f claudecode/claudecode-results.json ]; then
           FILE_SIZE=$(wc -c < claudecode/claudecode-results.json)

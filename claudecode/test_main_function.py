@@ -617,6 +617,7 @@ class TestAuditFailureModes:
             captured = capsys.readouterr()
             output = json.loads(captured.out)
             assert output == {
-                'error': 'Security audit incomplete: analysis_summary.review_completed is not true'
+                'error': 'Security audit incomplete: analysis_summary.review_completed is not true',
+                'scan_evidence': {'attempts': []}  # the runner here is a mock: no attempt evidence
             }
             mock_filter.filter_findings.assert_not_called()

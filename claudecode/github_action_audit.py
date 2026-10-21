@@ -12,6 +12,7 @@ import requests
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
 import re
+import math
 import time 
 
 # Import existing components we can reuse
@@ -186,6 +187,157 @@ class GitHubActionClient:
         return ''.join(filtered_sections)
 
 
+# Run and input evidence: one record per Claude Code attempt, printed as a SCAN-EVIDENCE line on
+# stderr and returned under `scan_evidence` in the results JSON. It states what the scan received
+# and how each run ended; it never claims the model read anything and never feeds the result gate.
+EVIDENCE_PREFIX = 'SCAN-EVIDENCE'
+UNKNOWN = 'unknown'
+NOT_PROVEN = 'not-proven'
+EVIDENCE_KEYS = [
+    'attempt', 'pr', 'head', 'checkout', 'model', 'models_used', 'exit', 'type', 'subtype',
+    'is_error', 'review_completed', 'files_pr', 'files_prompt', 'file_list', 'diff',
+    'diff_files', 'diff_bytes', 'prompt_chars', 'turns', 'duration_ms', 'cost_usd',
+    'tok_in', 'tok_out', 'tok_cache_read', 'tok_cache_write', 'denials', 'denials_by_tool',
+]
+_UNSAFE_TOKEN_CHARS = re.compile(r'[^A-Za-z0-9_.:,-]')
+_MAX_TOKEN_LENGTH = 500
+
+
+def _token(value: Any) -> str:
+    """Reduce a value to one log-safe token: no whitespace, no '=', no newline."""
+    return _UNSAFE_TOKEN_CHARS.sub('_', str(value))[:_MAX_TOKEN_LENGTH] or UNKNOWN
+
+
+def _list_part(value: Any) -> str:
+    """A token that is one element of a ','- or ':'-joined list value."""
+    return _token(value).replace(',', '_').replace(':', '_')
+
+
+def _text_value(value: Any) -> Any:
+    return _token(value) if isinstance(value, str) else UNKNOWN
+
+
+def _int_value(value: Any) -> Any:
+    return value if isinstance(value, int) and not isinstance(value, bool) else UNKNOWN
+
+
+def _number_value(value: Any) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return UNKNOWN
+    return value if math.isfinite(value) else UNKNOWN
+
+
+def _bool_value(value: Any) -> Any:
+    return value if isinstance(value, bool) else UNKNOWN
+
+
+def _dig(data: Any, *keys: str) -> Any:
+    """Nested dict lookup that yields None instead of raising."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _cli_result_object(cli_result: Any, stdout: Any) -> Dict[str, Any]:
+    """The CLI result object of an attempt; a failed run's stdout is read on a best-effort basis."""
+    if isinstance(cli_result, dict):
+        return cli_result
+    if isinstance(stdout, str):
+        try:
+            parsed = json.loads(stdout)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _models_used(model_usage: Any) -> str:
+    if not isinstance(model_usage, dict):
+        return UNKNOWN
+    return ','.join(_list_part(name) for name in model_usage) or 'none'
+
+
+def _denials_by_tool(denials: Any) -> Tuple[Any, Any]:
+    """(total, 'Tool:count,...' sorted by tool name); only tool names are read, never tool_input."""
+    if not isinstance(denials, list):
+        return UNKNOWN, UNKNOWN
+    counts: Dict[str, int] = {}
+    for denial in denials:
+        name = denial.get('tool_name') if isinstance(denial, dict) else None
+        key = _list_part(name) if isinstance(name, str) and name else UNKNOWN
+        counts[key] = counts.get(key, 0) + 1
+    return len(denials), ','.join(f'{name}:{count}' for name, count in sorted(counts.items())) or 'none'
+
+
+def _build_attempt_evidence(number: int, context: Any, prompt: str, exit_code: Any,
+                            cli_result: Any, stdout: Any, results: Any) -> Dict[str, Any]:
+    """Build the evidence entry of one attempt (see EVIDENCE_KEYS); a missing fact is "unknown"."""
+    context = context if isinstance(context, dict) else {}
+    cli = _cli_result_object(cli_result, stdout)
+    usage = cli.get('usage') if isinstance(cli.get('usage'), dict) else {}
+    files_pr = _int_value(context.get('files_pr'))
+    files_prompt = _int_value(context.get('files_prompt'))
+    if files_pr == UNKNOWN or files_prompt == UNKNOWN:
+        file_list = UNKNOWN
+    else:
+        file_list = 'complete' if files_prompt >= files_pr else f'{files_prompt}-of-{files_pr}'
+    diff_in_prompt = context.get('diff_in_prompt')
+    denials, denials_by_tool = _denials_by_tool(cli.get('permission_denials'))
+
+    entry = {
+        'attempt': number,
+        'pr': _int_value(context.get('pr')),
+        'head': _text_value(context.get('head')),
+        'checkout': _text_value(context.get('checkout')),
+        'model': _text_value(DEFAULT_CLAUDE_MODEL),
+        'models_used': _models_used(cli.get('modelUsage')),
+        'exit': 'timeout' if exit_code == 'timeout' else _int_value(exit_code),
+        'type': _text_value(cli.get('type')),
+        'subtype': _text_value(cli.get('subtype')),
+        'is_error': _bool_value(cli.get('is_error')),
+        'review_completed': _bool_value(_dig(results, 'analysis_summary', 'review_completed')),
+        'files_pr': files_pr,
+        'files_prompt': files_prompt,
+        'file_list': file_list,
+        'diff': 'yes' if diff_in_prompt is True else 'no' if diff_in_prompt is False else UNKNOWN,
+        'diff_files': _int_value(context.get('diff_files')),
+        'diff_bytes': _int_value(context.get('diff_bytes')),
+        'prompt_chars': len(prompt),
+        'turns': _int_value(cli.get('num_turns')),
+        'duration_ms': _number_value(cli.get('duration_ms')),
+        'cost_usd': _number_value(cli.get('total_cost_usd')),
+        'tok_in': _int_value(usage.get('input_tokens')),
+        'tok_out': _int_value(usage.get('output_tokens')),
+        'tok_cache_read': _int_value(usage.get('cache_read_input_tokens')),
+        'tok_cache_write': _int_value(usage.get('cache_creation_input_tokens')),
+        'denials': denials,
+        'denials_by_tool': denials_by_tool,
+    }
+    if entry['diff'] == 'no':
+        entry['reading'] = NOT_PROVEN  # the prompt carried no diff: nothing proves the model read the changes
+    return entry
+
+
+def _unknown_attempt_evidence(number: int) -> Dict[str, Any]:
+    """Fallback entry when building the real one failed: the attempt is still counted."""
+    entry = {key: UNKNOWN for key in EVIDENCE_KEYS}
+    entry['attempt'] = number
+    return entry
+
+
+def _format_evidence_line(entry: Dict[str, Any]) -> str:
+    """One SCAN-EVIDENCE line: fixed prefix, then space-separated key=value tokens."""
+    def render(value: Any) -> str:
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        return _token(value)
+
+    return ' '.join([EVIDENCE_PREFIX] + [f'{key}={render(value)}' for key, value in entry.items()])
+
+
 class SimpleClaudeRunner:
     """Simplified Claude Code runner for GitHub Actions."""
     
@@ -199,13 +351,37 @@ class SimpleClaudeRunner:
             self.timeout_seconds = timeout_minutes * 60
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
+        # Evidence of every Claude Code attempt of this run (the no-diff retry continues the count)
+        self._attempt_evidence: List[Dict[str, Any]] = []
+        self._attempt_count = 0
     
-    def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
+    def scan_evidence(self) -> Dict[str, Any]:
+        """Evidence of every Claude Code attempt so far, as published under `scan_evidence`."""
+        return {'attempts': [dict(entry) for entry in self._attempt_evidence]}
+    
+    def _record_attempt(self, number: int, context: Any, prompt: str, state: Dict[str, Any]) -> None:
+        """Record one attempt and print its SCAN-EVIDENCE line. Never raises into the scan."""
+        try:
+            try:
+                entry = _build_attempt_evidence(number, context, prompt, state.get('exit'),
+                                                state.get('cli_result'), state.get('stdout'),
+                                                state.get('results'))
+            except Exception:
+                entry = _unknown_attempt_evidence(number)
+            self._attempt_evidence.append(entry)
+            print(_format_evidence_line(entry), file=sys.stderr, flush=True)
+        except Exception:
+            pass
+    
+    def run_security_audit(self, repo_dir: Path, prompt: str,
+                           evidence_context: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
         
         Args:
             repo_dir: Path to repository directory
             prompt: Security audit prompt
+            evidence_context: Optional per-call facts for the attempt evidence (PR number, PR head
+                and checkout SHA, file counts, diff facts); anything missing is reported as unknown
             
         Returns:
             Tuple of (success, error_message, parsed_results)
@@ -231,59 +407,74 @@ class SimpleClaudeRunner:
             # Run Claude Code with retry logic
             NUM_RETRIES = 3
             for attempt in range(NUM_RETRIES):
-                result = subprocess.run(
-                    cmd,
-                    input=prompt,  # Pass prompt via stdin
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout_seconds
-                )
-                
-                if result.returncode != 0:
-                    if attempt == NUM_RETRIES - 1:
-                        error_details = f"Claude Code execution failed with return code {result.returncode}\n"
-                        error_details += f"Stderr: {result.stderr}\n"
-                        error_details += f"Stdout: {result.stdout[:500]}..."  # First 500 chars
-                        return False, error_details, {}
+                self._attempt_count += 1
+                attempt_number = self._attempt_count
+                attempt_state: Dict[str, Any] = {}
+                try:
+                    try:
+                        result = subprocess.run(
+                            cmd,
+                            input=prompt,  # Pass prompt via stdin
+                            cwd=repo_dir,
+                            capture_output=True,
+                            text=True,
+                            timeout=self.timeout_seconds
+                        )
+                    except subprocess.TimeoutExpired:
+                        attempt_state['exit'] = 'timeout'
+                        raise
+                    attempt_state['exit'] = result.returncode
+                    attempt_state['stdout'] = result.stdout
+                    
+                    if result.returncode != 0:
+                        if attempt == NUM_RETRIES - 1:
+                            error_details = f"Claude Code execution failed with return code {result.returncode}\n"
+                            error_details += f"Stderr: {result.stderr}\n"
+                            error_details += f"Stdout: {result.stdout[:500]}..."  # First 500 chars
+                            return False, error_details, {}
+                        else:
+                            time.sleep(5*attempt)
+                            # Note: We don't do exponential backoff here to keep the runtime reasonable
+                            continue  # Retry
+                    
+                    # Parse JSON output
+                    success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
+                    
+                    if success:
+                        attempt_state['cli_result'] = parsed_result
+                        # Check for "Prompt is too long" error that should trigger retry without diff
+                        if (isinstance(parsed_result, dict) and 
+                            parsed_result.get('type') == 'result' and 
+                            parsed_result.get('subtype') == 'success' and
+                            parsed_result.get('is_error') and
+                            parsed_result.get('result') == 'Prompt is too long'):
+                            return False, "PROMPT_TOO_LONG", {}
+                        
+                        # Check for error_during_execution that should trigger retry
+                        if (isinstance(parsed_result, dict) and 
+                            parsed_result.get('type') == 'result' and 
+                            parsed_result.get('subtype') == 'error_during_execution' and
+                            attempt == 0):
+                            continue  # Retry
+                        
+                        # Any other error result is a failed audit, never an empty one
+                        if (isinstance(parsed_result, dict) and
+                            parsed_result.get('type') == 'result' and
+                            parsed_result.get('is_error')):
+                            return False, f"Claude Code reported an error (subtype: {parsed_result.get('subtype')})", {}
+                        
+                        # Extract security findings
+                        parsed_results = self._extract_security_findings(parsed_result)
+                        attempt_state['results'] = parsed_results
+                        return True, "", parsed_results
                     else:
-                        time.sleep(5*attempt)
-                        # Note: We don't do exponential backoff here to keep the runtime reasonable
-                        continue  # Retry
-                
-                # Parse JSON output
-                success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
-                
-                if success:
-                    # Check for "Prompt is too long" error that should trigger retry without diff
-                    if (isinstance(parsed_result, dict) and 
-                        parsed_result.get('type') == 'result' and 
-                        parsed_result.get('subtype') == 'success' and
-                        parsed_result.get('is_error') and
-                        parsed_result.get('result') == 'Prompt is too long'):
-                        return False, "PROMPT_TOO_LONG", {}
-                    
-                    # Check for error_during_execution that should trigger retry
-                    if (isinstance(parsed_result, dict) and 
-                        parsed_result.get('type') == 'result' and 
-                        parsed_result.get('subtype') == 'error_during_execution' and
-                        attempt == 0):
-                        continue  # Retry
-                    
-                    # Any other error result is a failed audit, never an empty one
-                    if (isinstance(parsed_result, dict) and
-                        parsed_result.get('type') == 'result' and
-                        parsed_result.get('is_error')):
-                        return False, f"Claude Code reported an error (subtype: {parsed_result.get('subtype')})", {}
-                    
-                    # Extract security findings
-                    parsed_results = self._extract_security_findings(parsed_result)
-                    return True, "", parsed_results
-                else:
-                    if attempt == 0:
-                        continue  # Retry once
-                    else:
-                        return False, "Failed to parse Claude output", {}
+                        if attempt == 0:
+                            continue  # Retry once
+                        else:
+                            return False, "Failed to parse Claude output", {}
+                finally:
+                    # One evidence record per subprocess attempt, however the attempt ended
+                    self._record_attempt(attempt_number, evidence_context, prompt, attempt_state)
             
             return False, "Unexpected error in retry logic", {}
             
@@ -524,14 +715,83 @@ def _is_finding_in_excluded_directory(finding: Dict[str, Any], github_client: Gi
     return github_client._is_excluded(file_path)
 
 
+def _resolve_checkout_sha(repo_dir: Path) -> str:
+    """`git rev-parse HEAD` in the scanned directory, or "unknown" if it cannot be read.
+
+    Evidence only, computed once per run. It uses Popen so the lookup never shares call
+    accounting with the Claude Code runs, which go through subprocess.run.
+    """
+    try:
+        git = subprocess.Popen(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=repo_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        try:
+            stdout, _ = git.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            git.kill()
+            git.communicate()
+            return UNKNOWN
+        sha = stdout.strip()
+        if git.returncode == 0 and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha):
+            return sha
+    except Exception:
+        pass
+    return UNKNOWN
+
+
+def _build_evidence_context(pr_number: Any, pr_data: Any, pr_diff: Any, checkout_sha: str) -> Dict[str, Any]:
+    """Per-scan facts for the attempt evidence. Never raises; a fact it cannot read is left out."""
+    context: Dict[str, Any] = {'pr': pr_number, 'checkout': checkout_sha}
+    try:
+        context['head'] = _dig(pr_data, 'head', 'sha')
+        context['files_pr'] = _dig(pr_data, 'changed_files')
+        files = _dig(pr_data, 'files')
+        if isinstance(files, list):
+            context['files_prompt'] = len(files)  # the list the prompt names
+        if isinstance(pr_diff, str):
+            context['diff_files'] = len(re.findall(r'^diff --git', pr_diff, flags=re.MULTILINE))
+            context['diff_bytes'] = len(pr_diff.encode('utf-8'))
+    except Exception:
+        pass
+    return context
+
+
+def _diff_in_prompt(pr_diff: Any, prompt: Any) -> bool:
+    """True only if the fetched diff text is actually part of this attempt's prompt."""
+    return bool(isinstance(pr_diff, str) and isinstance(prompt, str) and pr_diff and pr_diff in prompt)
+
+
+def _scan_evidence_payload(claude_runner: Any) -> Dict[str, Any]:
+    """The `scan_evidence` value for the results JSON; an empty list if the runner has none to give."""
+    try:
+        attempts = claude_runner.scan_evidence()['attempts']
+        if isinstance(attempts, list):
+            json.dumps(attempts)  # it must serialise, or it is dropped
+            return {'attempts': attempts}
+    except Exception:
+        pass
+    return {'attempts': []}
+
+
+def _error_json(message: str, claude_runner: Any = None) -> str:
+    """The {"error": ...} output of main(), with the attempt evidence collected so far."""
+    return json.dumps({'error': message, 'scan_evidence': _scan_evidence_payload(claude_runner)})
+
+
 def main():
     """Main execution function for GitHub Action."""
+    claude_runner = None  # set once the clients exist; its evidence is attached to every output
     try:
         # Get environment configuration
         try:
             repo_name, pr_number = get_environment_config()
         except ConfigurationError as e:
-            print(json.dumps({'error': str(e)}))
+            print(_error_json(str(e), claude_runner))
             sys.exit(EXIT_CONFIGURATION_ERROR)
         
         # Load custom filtering instructions if provided
@@ -560,20 +820,20 @@ def main():
         try:
             github_client, claude_runner = initialize_clients()
         except ConfigurationError as e:
-            print(json.dumps({'error': str(e)}))
+            print(_error_json(str(e), claude_runner))
             sys.exit(EXIT_CONFIGURATION_ERROR)
             
         # Initialize findings filter
         try:
             findings_filter = initialize_findings_filter(custom_filtering_instructions)
         except ConfigurationError as e:
-            print(json.dumps({'error': str(e)}))
+            print(_error_json(str(e), claude_runner))
             sys.exit(EXIT_CONFIGURATION_ERROR)
         
         # Validate Claude Code is available
         claude_ok, claude_error = claude_runner.validate_claude_available()
         if not claude_ok:
-            print(json.dumps({'error': f'Claude Code not available: {claude_error}'}))
+            print(_error_json(f'Claude Code not available: {claude_error}', claude_runner))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # Get PR data
@@ -581,7 +841,7 @@ def main():
             pr_data = github_client.get_pr_data(repo_name, pr_number)
             pr_diff = github_client.get_pr_diff(repo_name, pr_number)
         except Exception as e:
-            print(json.dumps({'error': f'Failed to fetch PR data: {str(e)}'}))
+            print(_error_json(f'Failed to fetch PR data: {str(e)}', claude_runner))
             sys.exit(EXIT_GENERAL_ERROR)
                 
         # Generate security audit prompt
@@ -591,23 +851,30 @@ def main():
         # Get repo directory from environment or use current directory
         repo_path = os.environ.get('REPO_PATH')
         repo_dir = Path(repo_path) if repo_path else Path.cwd()
-        success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt)
+        evidence_context = _build_evidence_context(pr_number, pr_data, pr_diff, _resolve_checkout_sha(repo_dir))
+        success, error_msg, results = claude_runner.run_security_audit(
+            repo_dir, prompt,
+            evidence_context=dict(evidence_context, diff_in_prompt=_diff_in_prompt(pr_diff, prompt))
+        )
         
         # If prompt is too long, retry without diff
         if not success and error_msg == "PROMPT_TOO_LONG":
             print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
             prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
-            success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
+            success, error_msg, results = claude_runner.run_security_audit(
+                repo_dir, prompt_without_diff,
+                evidence_context=dict(evidence_context, diff_in_prompt=_diff_in_prompt(pr_diff, prompt_without_diff))
+            )
         
         if not success:
-            print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
+            print(_error_json(f'Security audit failed: {error_msg}', claude_runner))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # An audit that did not complete must never be reported as 0 findings
         audit_summary = results.get('analysis_summary', {})
         if not isinstance(audit_summary, dict) or audit_summary.get('review_completed') is not True:
-            print(json.dumps({'error': 'Security audit incomplete: analysis_summary.review_completed is not true'}))
+            print(_error_json('Security audit incomplete: analysis_summary.review_completed is not true', claude_runner))
             sys.exit(EXIT_GENERAL_ERROR)
         
         # Filter findings to reduce false positives
@@ -628,6 +895,7 @@ def main():
         
         # Prepare output
         output = {
+            'scan_evidence': _scan_evidence_payload(claude_runner),  # first, so the log preview shows it
             'pr_number': pr_number,
             'repo': repo_name,
             'findings': kept_findings,
@@ -649,7 +917,7 @@ def main():
         sys.exit(EXIT_GENERAL_ERROR if high_severity_count > 0 else EXIT_SUCCESS)
         
     except Exception as e:
-        print(json.dumps({'error': f'Unexpected error: {str(e)}'}))
+        print(_error_json(f'Unexpected error: {str(e)}', claude_runner))
         sys.exit(EXIT_CONFIGURATION_ERROR)
 
 
