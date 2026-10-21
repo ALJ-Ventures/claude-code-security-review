@@ -790,6 +790,87 @@ class TestMainEvidence:
         assert output['scan_evidence']['attempts'][1]['denials_by_tool'] == 'Bash:1'
 
 
+# --- result gate: every existing gate case, with and without the evidence block ---------------------------
+
+def _gate_complete(findings=None, **extra):
+    """Mirror of test_result_gate._complete: a results document from a scan that completed."""
+    data = {'findings': findings if findings is not None else [], 'analysis_summary': {'review_completed': True}}
+    data.update(extra)
+    return data
+
+
+# One row per case of claudecode/test_result_gate.py that has a results document to add the key to,
+# with the (ok, message) that test asserts: (source test, payload, exit code, expected verdict).
+# Not mirrored, because there is no JSON object to carry `scan_evidence`: test_missing_file,
+# test_empty_file, test_invalid_json, test_json_array and the TestResultGateCli missing-file case.
+# The two other TestResultGateCli cases are rows below (the CLI prints evaluate()'s message).
+GATE_CASES = [
+    # TestEvaluateFileChecks
+    ('test_findings_not_a_list', _gate_complete(findings={'file': 'a.py'}), '0', (False, 'results file invalid')),
+    ('test_error_key', {'error': 'Security audit failed: SECRET-MARKER-1234'}, '1',
+     (False, 'scan reported an error')),
+    ('test_error_key_wins_over_complete_result', _gate_complete(error='boom'), '0',
+     (False, 'scan reported an error')),
+    # TestEvaluateReviewCompleted
+    ('test_review_completed_false', {'findings': [], 'analysis_summary': {'review_completed': False}}, '0',
+     (False, 'review not completed')),
+    ('test_review_completed_missing', {'findings': [], 'analysis_summary': {'files_reviewed': 3}}, '0',
+     (False, 'review not completed')),
+    ('test_analysis_summary_missing', {'findings': []}, '0', (False, 'review not completed')),
+    ('test_review_completed_string_true', {'findings': [], 'analysis_summary': {'review_completed': 'true'}}, '0',
+     (False, 'review not completed')),
+    ('test_review_completed_number_one[int_1]', {'findings': [], 'analysis_summary': {'review_completed': 1}}, '0',
+     (False, 'review not completed')),
+    ('test_review_completed_number_one[float_1]', {'findings': [], 'analysis_summary': {'review_completed': 1.0}},
+     '0', (False, 'review not completed')),
+    # TestEvaluateExitCode
+    ('test_exit_0_no_findings', _gate_complete(), '0', (True, '0')),
+    ('test_exit_0_two_findings',
+     _gate_complete([{'file': 'a.py', 'severity': 'MEDIUM'}, {'file': 'b.py', 'severity': 'LOW'}]), '0',
+     (True, '2')),
+    ('test_exit_1_with_high_finding',
+     _gate_complete([{'file': 'a.py', 'severity': 'high'}, {'file': 'b.py', 'severity': 'LOW'}]), '1',
+     (True, '2')),
+    ('test_exit_1_without_high_finding', _gate_complete([{'file': 'a.py', 'severity': 'MEDIUM'}]), '1',
+     (False, 'exit code 1')),
+    ('test_exit_1_no_findings', _gate_complete(), '1', (False, 'exit code 1')),
+    ('test_exit_2_with_valid_complete_file', _gate_complete(), '2', (False, 'exit code 2')),
+    ('test_non_integer_exit_code[empty]', _gate_complete(), '', (False, 'exit code unknown')),
+    ('test_non_integer_exit_code[abc]', _gate_complete(), 'abc', (False, 'exit code unknown')),
+    ('test_non_integer_exit_code[1.5]', _gate_complete(), '1.5', (False, 'exit code unknown')),
+    # TestResultGateCli
+    ('test_cli_success', _gate_complete([{'file': 'a.py', 'severity': 'LOW'}]), '0', (True, '1')),
+    ('test_cli_failure', {'error': 'Security audit failed: x'}, '1', (False, 'scan reported an error')),
+]
+
+
+class TestGateWithAndWithoutEvidence:
+    """The result gate returns the identical (ok, message) with and without `scan_evidence`."""
+
+    @staticmethod
+    def recorded_evidence(capsys):
+        """A realistic evidence block: a retried attempt, then a no-diff attempt (has the `reading` key)."""
+        first = proc(cli_result(subtype='error_during_execution', is_error=True, drop=('result',)))
+        runner = SimpleClaudeRunner()
+        run_runner([first, proc(cli_result())], context=dict(CONTEXT, diff_in_prompt=False), runner=runner)
+        capsys.readouterr()
+        evidence = runner.scan_evidence()
+        assert len(evidence['attempts']) == 2 and evidence['attempts'][1]['reading'] == 'not-proven'
+        return evidence
+
+    @pytest.mark.parametrize('source, payload, exit_code, expected', GATE_CASES, ids=[c[0] for c in GATE_CASES])
+    @pytest.mark.parametrize('evidence_kind', ['empty', 'recorded'])
+    def test_every_gate_case_has_the_same_verdict(self, source, payload, exit_code, expected, evidence_kind,
+                                                  tmp_path, capsys):
+        evidence = {'attempts': []} if evidence_kind == 'empty' else self.recorded_evidence(capsys)
+
+        without = gate(tmp_path, payload, exit_code)
+        with_evidence = gate(tmp_path, dict(payload, scan_evidence=evidence), exit_code)
+
+        assert without == expected  # the verdict test_result_gate.py asserts for this case
+        assert with_evidence == without
+        assert 'SECRET-MARKER-1234' not in with_evidence[1]
+
 # --- action.yml: the echo between the scan and the gate ------------------------------------------------
 
 ACTION_YML = Path(__file__).resolve().parent.parent / 'action.yml'
