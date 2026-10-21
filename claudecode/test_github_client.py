@@ -145,11 +145,13 @@ class TestGitHubActionClient:
         assert mock_get.call_count == 2
         mock_get.assert_any_call(
             'https://api.github.com/repos/owner/repo/pulls/123',
-            headers=client.headers
+            headers=client.headers,
+            timeout=(10, 60)
         )
         mock_get.assert_any_call(
             'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=1',
-            headers=client.headers
+            headers=client.headers,
+            timeout=(10, 60)
         )
 
         # Verify result structure
@@ -511,3 +513,81 @@ class TestGitHubAPIIntegration:
         assert set(result['files'][0]) == {
             'filename', 'status', 'additions', 'deletions', 'changes', 'patch'
         }
+
+
+TIMEOUT_ERRORS = [requests.exceptions.Timeout, requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout]
+TIMEOUT_IDS = ['timeout', 'connect-timeout', 'read-timeout']
+
+
+class TestGitHubApiTimeouts:
+    """Every GitHub API call has a timeout, and a timeout is a fetch error that fails closed."""
+
+    def test_timeout_constant_is_connect_10_read_60(self):
+        assert GitHubActionClient.HTTP_TIMEOUT == (10, 60)
+
+    @patch('requests.get')
+    def test_every_pr_data_request_carries_the_timeout(self, mock_get):
+        """The PR metadata request and every file-page request get timeout=(10, 60)."""
+        mock_get.side_effect = [
+            make_pr_response(changed_files=250),
+            make_files_page(make_file_entries(0, 100)),
+            make_files_page(make_file_entries(100, 100)),
+            make_files_page(make_file_entries(200, 50)),
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            GitHubActionClient().get_pr_data('owner/repo', 123)
+
+        assert mock_get.call_count == 4  # PR metadata + three file pages
+        assert [call.kwargs.get('timeout') for call in mock_get.call_args_list] == [(10, 60)] * 4
+
+    @patch('requests.get')
+    def test_the_diff_request_carries_the_timeout(self, mock_get):
+        response = Mock()
+        response.text = 'diff --git a/a.py b/a.py\n+x = 1\n'
+        mock_get.return_value = response
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            GitHubActionClient().get_pr_diff('owner/repo', 123)
+
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs['timeout'] == (10, 60)
+
+    @pytest.mark.parametrize('error', TIMEOUT_ERRORS, ids=TIMEOUT_IDS)
+    @patch('requests.get')
+    def test_timeout_on_the_pr_metadata_raises(self, mock_get, error):
+        mock_get.side_effect = error('metadata timed out')
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(requests.exceptions.Timeout, match='metadata timed out'):
+                client.get_pr_data('owner/repo', 123)
+
+        assert mock_get.call_count == 1  # no file page is requested after it
+
+    @pytest.mark.parametrize('error', TIMEOUT_ERRORS, ids=TIMEOUT_IDS)
+    @patch('requests.get')
+    def test_timeout_on_a_file_page_raises_without_partial_list(self, mock_get, error):
+        """A timeout on page 2 raises out of get_pr_data; page 1 is never returned alone."""
+        mock_get.side_effect = [
+            make_pr_response(changed_files=250),
+            make_files_page(make_file_entries(0, 100)),
+            error('page 2 timed out'),
+        ]
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(requests.exceptions.Timeout, match='page 2 timed out'):
+                client.get_pr_data('owner/repo', 123)
+
+        assert requested_urls(mock_get)[1:] == [FILES_URL.format(page=1), FILES_URL.format(page=2)]
+
+    @pytest.mark.parametrize('error', TIMEOUT_ERRORS, ids=TIMEOUT_IDS)
+    @patch('requests.get')
+    def test_timeout_on_the_diff_raises(self, mock_get, error):
+        mock_get.side_effect = error('diff timed out')
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(requests.exceptions.Timeout, match='diff timed out'):
+                client.get_pr_diff('owner/repo', 123)

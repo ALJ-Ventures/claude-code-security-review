@@ -6,6 +6,7 @@ Unit tests for main function and full workflow.
 import pytest
 import json
 import os
+import requests
 from unittest.mock import Mock, patch
 from pathlib import Path
 
@@ -309,6 +310,90 @@ class TestMainFunction:
             assert '502 Server Error' in output['error']
             assert 'findings' not in output
             mock_runner.run_security_audit.assert_not_called()
+
+    @pytest.mark.parametrize('timeout_at', ['metadata', 'file-page-2', 'diff'])
+    @patch('requests.get')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    def test_main_github_api_timeout_fails_the_run(self, mock_runner_class, mock_filter_class,
+                                                   mock_get, timeout_at, capsys):
+        """A timeout on the PR metadata, on a file page or on the diff ends the run with an error."""
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner_class.return_value = mock_runner
+        mock_filter_class.return_value = Mock()
+
+        base = 'https://api.github.com/repos/owner/repo/pulls/123'
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Large PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 1010,
+            'deletions': 0,
+            'changed_files': 101
+        }
+        page_1 = Mock()
+        page_1.json.return_value = [
+            {
+                'filename': f'file{i}.py',
+                'status': 'added',
+                'additions': 10,
+                'deletions': 0,
+                'changes': 10,
+                'patch': '@@ -0,0 +1 @@\n+x'
+            }
+            for i in range(100)
+        ]
+        page_2 = Mock()
+        page_2.json.return_value = []
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        timed_out = {
+            'metadata': base,
+            'file-page-2': f'{base}/files?per_page=100&page=2',
+            'diff': 'diff',
+        }[timeout_at]
+        responses = {
+            base: pr_response,
+            f'{base}/files?per_page=100&page=1': page_1,
+            f'{base}/files?per_page=100&page=2': page_2,
+        }
+        timeouts = []
+
+        def route(url, headers=None, **kwargs):
+            timeouts.append(kwargs.get('timeout'))
+            is_diff = bool(headers and headers.get('Accept') == 'application/vnd.github.diff')
+            if (is_diff and timed_out == 'diff') or (not is_diff and url == timed_out):
+                raise requests.exceptions.ReadTimeout('Read timed out. (read timeout=60)')
+            return diff_response if is_diff else responses[url]
+
+        mock_get.side_effect = route
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'Failed to fetch PR data' in output['error']
+            assert 'Read timed out' in output['error']
+            assert 'findings' not in output
+            mock_runner.run_security_audit.assert_not_called()
+            assert timeouts and all(t == (10, 60) for t in timeouts)  # every call carried the timeout
 
     @patch('requests.get')
     @patch('claudecode.github_action_audit.FindingsFilter')

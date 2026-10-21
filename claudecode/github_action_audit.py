@@ -44,6 +44,8 @@ class GitHubActionClient:
     # The list-files endpoint pages at 100 entries and returns at most 3,000 files (30 pages).
     FILES_PER_PAGE = 100
     FILES_MAX_PAGES = 30
+    # (connect, read) seconds per GitHub API call; the read timeout applies between data packets, not to the whole body.
+    HTTP_TIMEOUT = (10, 60)
     
     def __init__(self):
         """Initialize GitHub client using environment variables."""
@@ -75,7 +77,7 @@ class GitHubActionClient:
         """
         # Get PR metadata
         pr_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-        response = requests.get(pr_url, headers=self.headers)
+        response = requests.get(pr_url, headers=self.headers, timeout=self.HTTP_TIMEOUT)
         response.raise_for_status()
         pr_data = response.json()
         
@@ -87,7 +89,7 @@ class GitHubActionClient:
                 f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files"
                 f"?per_page={self.FILES_PER_PAGE}&page={page}"
             )
-            response = requests.get(files_url, headers=self.headers)
+            response = requests.get(files_url, headers=self.headers, timeout=self.HTTP_TIMEOUT)
             response.raise_for_status()
             page_files = response.json()
             files_data.extend(page_files)
@@ -154,7 +156,7 @@ class GitHubActionClient:
         headers = dict(self.headers)
         headers['Accept'] = 'application/vnd.github.diff'
         
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=self.HTTP_TIMEOUT)
         response.raise_for_status()
         
         return self._filter_generated_files(response.text)
