@@ -233,9 +233,10 @@ runs:
         echo "Updated PYTHONPATH: $PYTHONPATH"
         
         # Run from the action root directory so Python can find the claudecode module
-        # The stderr log is written straight to the workspace root (not copied there later), so the
-        # always() upload step still finds the evidence lines when the job is cancelled mid-scan.
-        python -u claudecode/github_action_audit.py > claudecode/claudecode-results.json 2>"${{ github.workspace }}/claudecode-error.log" || CLAUDECODE_EXIT_CODE=$?
+        # The stderr log is written from the start to the runner temp dir: it survives a job cancelled
+        # mid-scan, and it stays out of the scanned workspace, so a retry never reads an earlier
+        # attempt's diagnostics. A step before the upload copies it to the workspace root.
+        python -u claudecode/github_action_audit.py > claudecode/claudecode-results.json 2>"${{ runner.temp }}/claudecode-error.log" || CLAUDECODE_EXIT_CODE=$?
         
         if [ -n "$CLAUDECODE_EXIT_CODE" ]; then
           echo "::warning::ClaudeCode exited with code $CLAUDECODE_EXIT_CODE"
@@ -245,8 +246,8 @@ runs:
         echo "::endgroup::"
         
         # Run and input evidence: one line per Claude Code attempt (counts, enums, SHAs and timings only)
-        if [ -f "${{ github.workspace }}/claudecode-error.log" ]; then
-          grep '^SCAN-EVIDENCE ' "${{ github.workspace }}/claudecode-error.log" || true
+        if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
+          grep '^SCAN-EVIDENCE ' "${{ runner.temp }}/claudecode-error.log" || true
         fi
         
         echo "::group::ClaudeCode Results"
@@ -259,9 +260,9 @@ runs:
           if [ "$FILE_SIZE" -lt 2 ]; then
             echo "::warning::ClaudeCode results file is empty or invalid (size: $FILE_SIZE bytes)"
             echo "::warning::ClaudeCode may have failed silently. Check claudecode-error.log"
-            if [ -f "${{ github.workspace }}/claudecode-error.log" ]; then
+            if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
               echo "Error log contents:"
-              cat "${{ github.workspace }}/claudecode-error.log"
+              cat "${{ runner.temp }}/claudecode-error.log"
             fi
           else
             echo "ClaudeCode results preview:"
@@ -275,9 +276,9 @@ runs:
           fi
         else
           echo "::warning::ClaudeCode results file not found"
-          if [ -f "${{ github.workspace }}/claudecode-error.log" ]; then
+          if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
             echo "Error log contents:"
-            cat "${{ github.workspace }}/claudecode-error.log"
+            cat "${{ runner.temp }}/claudecode-error.log"
           fi
         fi
         
@@ -312,7 +313,7 @@ runs:
         fi
 
         # Always copy the results file to workspace root regardless of the outcome
-        # This ensures artifact upload can find it (the error log is already written there)
+        # This ensures artifact upload can find it (the error log is copied by its own step below)
         if [ -f claudecode/claudecode-results.json ]; then
           cp claudecode/claudecode-results.json ${{ github.workspace }}/claudecode-results.json || true
         fi
@@ -330,6 +331,16 @@ runs:
       with:
         path: .claudecode-marker
         key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+    
+    # The live scan log sits in the runner temp dir (outside the scanned workspace); the upload step reads
+    # claudecode-error.log at the workspace root, so it is copied there once the scan is over, killed or not
+    - name: Stage scan log for upload
+      if: always() && inputs.upload-results == 'true'
+      shell: bash
+      run: |
+        if [ -f "${{ runner.temp }}/claudecode-error.log" ]; then
+          cp "${{ runner.temp }}/claudecode-error.log" "${{ github.workspace }}/claudecode-error.log"
+        fi
     
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'

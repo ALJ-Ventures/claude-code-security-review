@@ -959,19 +959,50 @@ class TestGateWithAndWithoutEvidence:
 
 ACTION_YML = Path(__file__).resolve().parent.parent / 'action.yml'
 
-# The scan step writes its stderr log straight to the workspace root; GitHub expands this expression
-# (inside double quotes in the script) before bash runs, so the test expands it the same way.
+# The scan step writes its stderr log under the runner temp dir (outside the scanned workspace); GitHub
+# expands these expressions (inside double quotes in the script) before bash runs, so the tests expand
+# them the same way.
+TEMP_EXPR = '${{ runner.temp }}'
 WORKSPACE_EXPR = '${{ github.workspace }}'
-ERROR_LOG_EXPR = '"' + WORKSPACE_EXPR + '/claudecode-error.log"'
+ERROR_LOG_EXPR = '"' + TEMP_EXPR + '/claudecode-error.log"'
+WORKSPACE_LOG_EXPR = '"' + WORKSPACE_EXPR + '/claudecode-error.log"'
+
+SCAN_STEP = 'Run ClaudeCode scan'
+STAGE_STEP = 'Stage scan log for upload'
+UPLOAD_STEP = 'Upload scan results'
 
 
-def echo_block(workspace):
+def step_text(name):
+    """The text of one composite step of action.yml, from its `- name:` line up to the next step or comment."""
+    text = ACTION_YML.read_text(encoding='utf-8')
+    start = text.index(f'    - name: {name}\n')
+    ends = [text.find(marker, start + 1) for marker in ('\n    - name: ', '\n    # ', '\nbranding:')]
+    return text[start:min(end for end in ends if end != -1)]
+
+
+def step_script(name):
+    """The `run: |` script of one step, dedented to a standalone shell snippet."""
+    lines = step_text(name).split('run: |\n', 1)[1].splitlines()
+    return '\n'.join(line[8:] for line in lines) + '\n'
+
+
+def expand(script, temp_dir, workspace):
+    return script.replace(TEMP_EXPR, str(temp_dir)).replace(WORKSPACE_EXPR, str(workspace))
+
+
+def echo_block(temp_dir):
     """The evidence echo of the scan step, dedented to a standalone shell snippet."""
     text = ACTION_YML.read_text(encoding='utf-8')
     start = text.index('        # Run and input evidence')
     end = text.index('        fi\n', start) + len('        fi\n')
     block = '\n'.join(line[8:] for line in text[start:end].splitlines()) + '\n'
-    return block.replace(WORKSPACE_EXPR, str(workspace))
+    return block.replace(TEMP_EXPR, str(temp_dir))
+
+
+def run_bash(script, cwd):
+    # the same shell flags GitHub uses for `shell: bash`
+    return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', script],
+                          cwd=cwd, capture_output=True, text=True)
 
 
 class TestActionEvidenceEcho:
@@ -985,13 +1016,33 @@ class TestActionEvidenceEcho:
         assert 'result_gate claudecode/claudecode-results.json "${CLAUDECODE_EXIT_CODE:-0}")' in text
         assert 'result_gate' not in text[echo - 200:echo + 200]
 
-    def test_error_log_is_written_at_the_workspace_root_from_the_start(self):
-        # a job timeout cancels the step before any end-of-step copy runs, so the log must not need one
-        text = ACTION_YML.read_text(encoding='utf-8')
-        python_line = next(line for line in text.splitlines() if 'python -u claudecode/github_action_audit.py' in line)
+    def test_error_log_is_written_under_runner_temp_from_the_start(self):
+        # a job timeout cancels the step before any end-of-step copy runs, so the log must not need one;
+        # it must also stay out of the scanned workspace, where later attempts could read earlier ones
+        scan = step_text(SCAN_STEP)
+        python_line = next(line for line in scan.splitlines() if 'python -u claudecode/github_action_audit.py' in line)
         assert f'2>{ERROR_LOG_EXPR} ||' in python_line
-        assert 'claudecode/claudecode-error.log' not in text  # no reference to a log under the action dir
-        assert 'cp claudecode/claudecode-error.log' not in text  # and no end-of-step copy of it
+        assert 'claudecode/claudecode-error.log' not in ACTION_YML.read_text(encoding='utf-8')
+        assert WORKSPACE_LOG_EXPR not in scan  # the scan step never touches a log in the workspace
+        assert 'claudecode-error.log' not in scan.replace(ERROR_LOG_EXPR, '').replace('Check claudecode-error.log', '')
+
+    def test_log_is_staged_into_the_workspace_by_an_always_step_right_before_the_upload(self):
+        text = ACTION_YML.read_text(encoding='utf-8')
+        stage = step_text(STAGE_STEP)
+        # nothing sits between the staging step and the upload step but the staging step itself
+        between = text[text.index(stage) + len(stage):text.index(f'    - name: {UPLOAD_STEP}\n')]
+        assert '- name:' not in between
+        assert "if: always() && inputs.upload-results == 'true'" in stage
+        assert 'shell: bash' in stage
+        assert f'if [ -f {ERROR_LOG_EXPR} ]; then' in stage  # guarded: no log, no copy
+        assert f'cp {ERROR_LOG_EXPR} {WORKSPACE_LOG_EXPR}' in stage
+        assert '|| true' not in stage
+
+    def test_upload_keeps_its_flat_relative_path(self):
+        upload = step_text(UPLOAD_STEP)
+        assert "if: always() && inputs.upload-results == 'true'" in upload
+        assert '          claudecode-error.log\n' in upload
+        assert 'runner.temp' not in upload and 'github.workspace' not in upload  # no absolute path: flat layout
 
     def test_echo_prints_outside_any_log_group(self):
         text = ACTION_YML.read_text(encoding='utf-8')
@@ -1006,18 +1057,16 @@ class TestActionEvidenceEcho:
 
     @pytest.mark.skipif(shutil.which('bash') is None, reason='bash not available')
     def test_echo_prints_only_evidence_lines_and_never_fails_the_step(self, tmp_path):
-        # workspace and action dir differ, as in a normal run (the step cd's into the action dir);
-        # the workspace path holds a space to prove the quoting
-        workspace = tmp_path / 'work space'
+        # runner temp dir, workspace and action dir all differ, as in a normal run (the step cd's into the
+        # action dir); the temp path holds a space to prove the quoting
+        temp_dir = tmp_path / 'runner temp'
         action_dir = tmp_path / 'action'
-        workspace.mkdir()
+        temp_dir.mkdir()
         action_dir.mkdir()
-        log = workspace / 'claudecode-error.log'
+        log = temp_dir / 'claudecode-error.log'
 
         def run():
-            # the same shell flags GitHub uses for `shell: bash`
-            return subprocess.run(['bash', '--noprofile', '--norc', '-eo', 'pipefail', '-c', echo_block(workspace)],
-                                  cwd=action_dir, capture_output=True, text=True)
+            return run_bash(echo_block(temp_dir), action_dir)
 
         log.write_text('[Info] something\nSCAN-EVIDENCE attempt=1 pr=42\n'
                        '[mod] SCAN-EVIDENCE not=at-column-zero\nSCAN-EVIDENCE attempt=2 pr=42\n', encoding='utf-8')
@@ -1032,3 +1081,35 @@ class TestActionEvidenceEcho:
         log.unlink()  # no log at all
         done = run()
         assert (done.returncode, done.stdout) == (0, '')
+
+
+@pytest.mark.skipif(shutil.which('bash') is None, reason='bash not available')
+class TestActionStageScanLog:
+    """The step before the upload moves the live log from runner temp into the workspace root."""
+
+    @staticmethod
+    def dirs(tmp_path):
+        temp_dir = tmp_path / 'runner temp'
+        workspace = tmp_path / 'work space'
+        temp_dir.mkdir()
+        workspace.mkdir()
+        return temp_dir, workspace
+
+    def test_copies_the_log_into_the_workspace_root(self, tmp_path):
+        temp_dir, workspace = self.dirs(tmp_path)
+        (temp_dir / 'claudecode-error.log').write_text('SCAN-EVIDENCE attempt=1 pr=42\n', encoding='utf-8')
+
+        done = run_bash(expand(step_script(STAGE_STEP), temp_dir, workspace), tmp_path)
+
+        assert done.returncode == 0
+        assert (workspace / 'claudecode-error.log').read_text(encoding='utf-8') == 'SCAN-EVIDENCE attempt=1 pr=42\n'
+        assert (temp_dir / 'claudecode-error.log').exists()  # a copy, not a move
+
+    def test_without_a_log_it_does_nothing_and_succeeds(self, tmp_path):
+        # e.g. the scan step skipped itself (not a pull request) before it ever started python
+        temp_dir, workspace = self.dirs(tmp_path)
+
+        done = run_bash(expand(step_script(STAGE_STEP), temp_dir, workspace), tmp_path)
+
+        assert (done.returncode, done.stdout, done.stderr) == (0, '', '')
+        assert list(workspace.iterdir()) == []
