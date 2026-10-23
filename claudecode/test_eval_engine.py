@@ -141,6 +141,8 @@ class TestEvaluationEngine:
     def test_clean_worktrees(self, mock_run, mock_exists):
         """Test worktree cleanup."""
         with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'test-key'}):
+            # The gh auth token mock below only fires when GITHUB_TOKEN is unset; drop an ambient token (patch.dict restores it)
+            os.environ.pop('GITHUB_TOKEN', None)
             # Mock git auth token call in __init__
             mock_run.side_effect = [
                 Mock(returncode=1, stdout=""),  # gh auth token (fails, no token)
@@ -208,6 +210,8 @@ class TestEvaluationEngine:
     def test_run_sast_audit_success(self, mock_run):
         """Test successful SAST audit run."""
         with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'test-key'}):
+            # The gh auth token mock below only fires when GITHUB_TOKEN is unset; drop an ambient token (patch.dict restores it)
+            os.environ.pop('GITHUB_TOKEN', None)
             # Mock gh auth token call first, then the audit
             mock_run.side_effect = [
                 Mock(returncode=1, stdout=""),  # gh auth token (fails, no token)
@@ -232,6 +236,8 @@ class TestEvaluationEngine:
     def test_run_sast_audit_failure(self, mock_run):
         """Test failed SAST audit run."""
         with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'test-key'}):
+            # The gh auth token mock below only fires when GITHUB_TOKEN is unset; drop an ambient token (patch.dict restores it)
+            os.environ.pop('GITHUB_TOKEN', None)
             mock_run.side_effect = [
                 Mock(returncode=1, stdout=""),  # gh auth token (fails, no token)
                 Mock(returncode=1, stdout="", stderr="Error running audit")  # SAST audit fails

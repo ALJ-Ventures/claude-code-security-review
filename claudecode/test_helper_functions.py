@@ -17,6 +17,12 @@ from claudecode.github_action_audit import (
 from claudecode.findings_filter import FindingsFilter
 
 
+# action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
+@pytest.fixture(autouse=True)
+def isolate_claude_timeout(monkeypatch):
+    monkeypatch.delenv('CLAUDE_TIMEOUT', raising=False)
+
+
 class TestHelperFunctions:
     """Test helper functions in github_action_audit module."""
     
@@ -98,6 +104,41 @@ class TestHelperFunctions:
         assert "Failed to initialize Claude runner" in str(exc_info.value)
         assert "Claude init error" in str(exc_info.value)
     
+    @pytest.mark.parametrize('env', [{}, {'CLAUDE_TIMEOUT': ''}, {'CLAUDE_TIMEOUT': '   '}])
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_initialize_clients_claude_timeout_default(self, mock_github_client, env):
+        """An unset or empty CLAUDE_TIMEOUT keeps the 1200 s default."""
+        mock_github_client.return_value = MagicMock()
+
+        with patch.dict(os.environ, env, clear=True):
+            _, claude_runner = initialize_clients()
+
+        assert claude_runner.timeout_seconds == 1200
+
+    @pytest.mark.parametrize('value', ['35', ' 35 '])
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_initialize_clients_claude_timeout_from_env(self, mock_github_client, value):
+        """A positive integer CLAUDE_TIMEOUT is read in minutes, surrounding whitespace ignored."""
+        mock_github_client.return_value = MagicMock()
+
+        with patch.dict(os.environ, {'CLAUDE_TIMEOUT': value}, clear=True):
+            _, claude_runner = initialize_clients()
+
+        assert claude_runner.timeout_seconds == 2100
+
+    @pytest.mark.parametrize('value', ['0', '-5', 'abc', '2.5'])
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_initialize_clients_claude_timeout_invalid(self, mock_github_client, value):
+        """A non-positive or non-integer CLAUDE_TIMEOUT fails closed with a ConfigurationError."""
+        mock_github_client.return_value = MagicMock()
+
+        with patch.dict(os.environ, {'CLAUDE_TIMEOUT': value}, clear=True):
+            with pytest.raises(ConfigurationError) as exc_info:
+                initialize_clients()
+
+        assert 'CLAUDE_TIMEOUT' in str(exc_info.value)
+        assert 'positive whole number of minutes' in str(exc_info.value)
+
     @patch('claudecode.github_action_audit.FindingsFilter')
     def test_initialize_findings_filter_with_claude(self, mock_filter):
         """Test initializing findings filter with Claude API enabled."""

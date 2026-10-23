@@ -13,6 +13,12 @@ from pathlib import Path
 from claudecode.github_action_audit import main
 
 
+# action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
+@pytest.fixture(autouse=True)
+def isolate_claude_timeout(monkeypatch):
+    monkeypatch.delenv('CLAUDE_TIMEOUT', raising=False)
+
+
 class TestFullWorkflowIntegration:
     """Test complete workflow scenarios."""
     
@@ -41,7 +47,7 @@ class TestFullWorkflowIntegration:
             },
             'additions': 250,
             'deletions': 50,
-            'changed_files': 8
+            'changed_files': 2
         }
         
         files_response = Mock()
@@ -230,7 +236,7 @@ index 8901234..5678901 100644
             'base': {'ref': 'main', 'sha': 'main456'},
             'additions': 100,
             'deletions': 80,
-            'changed_files': 5
+            'changed_files': 0
         }
         
         files_response = Mock()
@@ -317,7 +323,7 @@ index 8901234..5678901 100644
             'base': {'ref': 'main', 'sha': 'main789'},
             'additions': 50,
             'deletions': 10,
-            'changed_files': 2
+            'changed_files': 1
         }
         
         files_response = Mock()
@@ -407,8 +413,15 @@ class TestWorkflowEdgeCases:
             'changed_files': 500
         }
         
-        files_response = Mock()
-        files_response.json.return_value = large_files
+        # The files endpoint pages at 100 entries: five full pages, then an empty sixth
+        # page that confirms the list is complete.
+        file_pages = []
+        for start in range(0, 500, 100):
+            page_response = Mock()
+            page_response.json.return_value = large_files[start:start + 100]
+            file_pages.append(page_response)
+        empty_page = Mock()
+        empty_page.json.return_value = []
         
         # Create massive diff
         diff_parts = []
@@ -425,7 +438,7 @@ index 0000000..1234567
         diff_response = Mock()
         diff_response.text = '\n'.join(diff_parts)
         
-        mock_get.side_effect = [pr_response, files_response, diff_response]
+        mock_get.side_effect = [pr_response, *file_pages, empty_page, diff_response]
         
         # Claude handles it gracefully
         mock_run.side_effect = [

@@ -1,9 +1,6 @@
 # Requirements for claudecode - Claude Code PR Security Audit Tool
 # Core dependencies for the GitHub Action version
 
-# GitHub API client
-PyGithub>=1.59.0
-
 # HTTP requests for GitHub API
 requests>=2.28.0
 

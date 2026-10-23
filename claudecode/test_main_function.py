@@ -6,10 +6,19 @@ Unit tests for main function and full workflow.
 import pytest
 import json
 import os
+import re
+import requests
 from unittest.mock import Mock, patch
 from pathlib import Path
 
-from claudecode.github_action_audit import main
+from claudecode import result_gate
+from claudecode.github_action_audit import SimpleClaudeRunner, main
+
+
+# action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
+@pytest.fixture(autouse=True)
+def isolate_claude_timeout(monkeypatch):
+    monkeypatch.delenv('CLAUDE_TIMEOUT', raising=False)
 
 
 class TestMainFunction:
@@ -96,6 +105,26 @@ class TestMainFunction:
             output = json.loads(captured.out)
             assert 'Failed to initialize Claude runner' in output['error']
     
+    @patch('claudecode.github_action_audit.GitHubActionClient')
+    def test_main_invalid_claude_timeout(self, mock_client_class, capsys):
+        """Test main fails closed with an error JSON when CLAUDE_TIMEOUT is invalid."""
+        mock_client_class.return_value = Mock()
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token',
+            'CLAUDE_TIMEOUT': '0'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 2  # EXIT_CONFIGURATION_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'CLAUDE_TIMEOUT' in output['error']
+
     @patch('claudecode.github_action_audit.FindingsFilter')
     @patch('claudecode.github_action_audit.SimpleClaudeRunner')
     @patch('claudecode.github_action_audit.GitHubActionClient')
@@ -208,7 +237,329 @@ class TestMainFunction:
             output = json.loads(captured.out)
             assert 'Failed to fetch PR data' in output['error']
             assert 'API error' in output['error']
-    
+
+    @patch('requests.get')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    def test_main_file_list_page_error_fails_the_run(self, mock_runner_class, mock_filter_class,
+                                                     mock_get, capsys):
+        """A failing page 2 of the PR file list ends the run with an error, never a findings result."""
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner_class.return_value = mock_runner
+        mock_filter_class.return_value = Mock()
+
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Large PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 2500,
+            'deletions': 0,
+            'changed_files': 250
+        }
+        page_1 = Mock()
+        page_1.json.return_value = [
+            {
+                'filename': f'file{i}.py',
+                'status': 'added',
+                'additions': 10,
+                'deletions': 0,
+                'changes': 10,
+                'patch': '@@ -0,0 +1 @@\n+x'
+            }
+            for i in range(100)
+        ]
+        page_2 = Mock()
+        page_2.raise_for_status.side_effect = Exception("502 Server Error: Bad Gateway")
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        # Routed by URL, so the run only fails if page 2 of the file list is requested and errors;
+        # an unpaged file-list request or a reordered call sequence cannot reach the same result.
+        responses = {
+            'https://api.github.com/repos/owner/repo/pulls/123': pr_response,
+            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=1': page_1,
+            'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page=2': page_2,
+        }
+
+        def route(url, headers=None, **kwargs):
+            if headers and headers.get('Accept') == 'application/vnd.github.diff':
+                return diff_response
+            return responses[url]
+
+        mock_get.side_effect = route
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'Failed to fetch PR data' in output['error']
+            assert '502 Server Error' in output['error']
+            assert 'findings' not in output
+            mock_runner.run_security_audit.assert_not_called()
+
+    @pytest.mark.parametrize('timeout_at', ['metadata', 'file-page-2', 'diff'])
+    @patch('requests.get')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    def test_main_github_api_timeout_fails_the_run(self, mock_runner_class, mock_filter_class,
+                                                   mock_get, timeout_at, capsys):
+        """A timeout on the PR metadata, on a file page or on the diff ends the run with an error."""
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner_class.return_value = mock_runner
+        mock_filter_class.return_value = Mock()
+
+        base = 'https://api.github.com/repos/owner/repo/pulls/123'
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Large PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 1010,
+            'deletions': 0,
+            'changed_files': 100
+        }
+        page_1 = Mock()
+        page_1.json.return_value = [
+            {
+                'filename': f'file{i}.py',
+                'status': 'added',
+                'additions': 10,
+                'deletions': 0,
+                'changes': 10,
+                'patch': '@@ -0,0 +1 @@\n+x'
+            }
+            for i in range(100)
+        ]
+        page_2 = Mock()
+        page_2.json.return_value = []
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        timed_out = {
+            'metadata': base,
+            'file-page-2': f'{base}/files?per_page=100&page=2',
+            'diff': 'diff',
+        }[timeout_at]
+        responses = {
+            base: pr_response,
+            f'{base}/files?per_page=100&page=1': page_1,
+            f'{base}/files?per_page=100&page=2': page_2,
+        }
+        timeouts = []
+
+        def route(url, headers=None, **kwargs):
+            timeouts.append(kwargs.get('timeout'))
+            is_diff = bool(headers and headers.get('Accept') == 'application/vnd.github.diff')
+            if (is_diff and timed_out == 'diff') or (not is_diff and url == timed_out):
+                raise requests.exceptions.ReadTimeout('Read timed out. (read timeout=60)')
+            return diff_response if is_diff else responses[url]
+
+        mock_get.side_effect = route
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'Failed to fetch PR data' in output['error']
+            assert 'Read timed out' in output['error']
+            assert 'findings' not in output
+            mock_runner.run_security_audit.assert_not_called()
+            assert timeouts and all(t == (10, 60) for t in timeouts)  # every call carried the timeout
+
+    @patch('requests.get')
+    @patch('claudecode.github_action_audit.FindingsFilter')
+    @patch('claudecode.github_action_audit.SimpleClaudeRunner')
+    def test_main_pr_beyond_file_list_cap_fails_the_run(self, mock_runner_class, mock_filter_class,
+                                                        mock_get, capsys):
+        """A PR with more changed files than the 3,000 the API lists ends the run with an error."""
+        mock_runner = Mock()
+        mock_runner.validate_claude_available.return_value = (True, "")
+        mock_runner_class.return_value = mock_runner
+        mock_filter_class.return_value = Mock()
+
+        base = 'https://api.github.com/repos/owner/repo/pulls/123'
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Huge PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 32000,
+            'deletions': 0,
+            'changed_files': 3200
+        }
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        def make_page(n):
+            page = Mock()
+            page.json.return_value = [
+                {
+                    'filename': f'file{n * 100 + i}.py',
+                    'status': 'added',
+                    'additions': 10,
+                    'deletions': 0,
+                    'changes': 10,
+                    'patch': '@@ -0,0 +1 @@\n+x'
+                }
+                for i in range(100)
+            ]
+            return page
+
+        responses = {base: pr_response}
+        for n in range(30):
+            responses[f'{base}/files?per_page=100&page={n + 1}'] = make_page(n)
+        requested = []
+
+        def route(url, headers=None, **kwargs):
+            requested.append(url)
+            if headers and headers.get('Accept') == 'application/vnd.github.diff':
+                return diff_response
+            return responses[url]
+
+        mock_get.side_effect = route
+
+        with patch.dict(os.environ, {
+            'GITHUB_REPOSITORY': 'owner/repo',
+            'PR_NUMBER': '123',
+            'GITHUB_TOKEN': 'test-token'
+        }):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+            assert exc_info.value.code == 1  # EXIT_GENERAL_ERROR
+
+            captured = capsys.readouterr()
+            output = json.loads(captured.out)
+            assert 'Failed to fetch PR data' in output['error']
+            assert '3200' in output['error'] and '3000' in output['error']
+            assert 'findings' not in output
+            assert f'{base}/files?per_page=100&page=31' not in requested
+            mock_runner.run_security_audit.assert_not_called()
+
+    @pytest.mark.parametrize('page_sizes', [[0], [93], [100, 0]],
+                             ids=['empty-first-page', 'short-page-before-the-end', 'empty-second-page'])
+    @patch('requests.get')
+    def test_main_file_list_shorter_than_changed_files_fails_before_the_scan(self, mock_get, page_sizes,
+                                                                             tmp_path, capsys):
+        """Q4: a file list shorter than changed_files (194) ends the run before any Claude call, and
+        the result gate reads the output as a failed scan, never as 0 findings."""
+        base = 'https://api.github.com/repos/owner/repo/pulls/123'
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Partial list PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 1940,
+            'deletions': 0,
+            'changed_files': 194
+        }
+        responses = {base: pr_response}
+        start = 0
+        for number, size in enumerate(page_sizes, start=1):
+            page = Mock()
+            page.json.return_value = [
+                {
+                    'filename': f'file{i}.py',
+                    'status': 'added',
+                    'additions': 10,
+                    'deletions': 0,
+                    'changes': 10,
+                    'patch': '@@ -0,0 +1 @@\n+x'
+                }
+                for i in range(start, start + size)
+            ]
+            responses[f'{base}/files?per_page=100&page={number}'] = page
+            start += size
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        def route(url, headers=None, **kwargs):
+            if headers and headers.get('Accept') == 'application/vnd.github.diff':
+                return diff_response
+            return responses[url]
+
+        mock_get.side_effect = route
+
+        # Real runner: the availability check is the only subprocess call a correct run makes. The
+        # completed audit result is there so a run that wrongly reaches the scan goes green.
+        version = Mock(returncode=0, stdout='2.1.285 (Claude Code)', stderr='')
+        completed = Mock(returncode=0, stderr='', stdout=json.dumps({'result': json.dumps(
+            {'findings': [], 'analysis_summary': {'review_completed': True}})}))
+        with patch('claudecode.github_action_audit.subprocess.run', side_effect=[version, completed]) as mock_run, \
+                patch.object(SimpleClaudeRunner, 'run_security_audit', autospec=True,
+                             side_effect=SimpleClaudeRunner.run_security_audit) as audit, \
+                patch.dict(os.environ, {
+                    'GITHUB_REPOSITORY': 'owner/repo',
+                    'PR_NUMBER': '123',
+                    'GITHUB_TOKEN': 'test-token',
+                    'ANTHROPIC_API_KEY': 'test-api-key',
+                    'ENABLE_CLAUDE_FILTERING': 'false',
+                    'REPO_PATH': str(tmp_path)
+                }):
+            for name in ('EXCLUDE_DIRECTORIES', 'FALSE_POSITIVE_FILTERING_INSTRUCTIONS',
+                         'CUSTOM_SECURITY_SCAN_INSTRUCTIONS'):
+                os.environ.pop(name, None)
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        code = exc_info.value.code
+        output = json.loads(capsys.readouterr().out)
+        assert code == 1  # EXIT_GENERAL_ERROR
+        assert output['error'].startswith('Failed to fetch PR data')
+        assert sorted(int(n) for n in re.findall(r'\d+', output['error'])) == sorted([194, sum(page_sizes)])
+        assert 'scan_evidence' in output
+        assert output['scan_evidence'] == {'attempts': []}  # no Claude Code attempt was made
+        assert 'findings' not in output
+        audit.assert_not_called()
+        assert [call.args[0] for call in mock_run.call_args_list] == [['claude', '--version']]
+
+        results_file = tmp_path / 'claudecode-results.json'
+        results_file.write_text(json.dumps(output), encoding='utf-8')
+        assert result_gate.evaluate(str(results_file), str(code)) == (False, 'scan reported an error')
+
     @patch('pathlib.Path.cwd')
     @patch('claudecode.github_action_audit.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')
@@ -617,6 +968,7 @@ class TestAuditFailureModes:
             captured = capsys.readouterr()
             output = json.loads(captured.out)
             assert output == {
-                'error': 'Security audit incomplete: analysis_summary.review_completed is not true'
+                'error': 'Security audit incomplete: analysis_summary.review_completed is not true',
+                'scan_evidence': {'attempts': []}  # the runner here is a mock: no attempt evidence
             }
             mock_filter.filter_findings.assert_not_called()

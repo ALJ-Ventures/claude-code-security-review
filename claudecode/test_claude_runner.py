@@ -4,13 +4,99 @@ Unit tests for SimpleClaudeRunner.
 """
 
 import json
+import logging
 import os
 import subprocess
 from unittest.mock import Mock, patch
 from pathlib import Path
 
-from claudecode.github_action_audit import SimpleClaudeRunner
+import pytest
+
+from claudecode.github_action_audit import SimpleClaudeRunner, _is_prompt_too_long, main
 from claudecode.constants import DEFAULT_CLAUDE_MODEL
+
+# Claude Code results that report an over-long prompt (type result, is_error true)
+PROMPT_TOO_LONG_RESULTS = {
+    'exact-text': {
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "Prompt is too long"},
+    'text-with-detail': {
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "Prompt is too long · this conversation is a single exchange and cannot be compacted"},
+    'text-in-errors': {
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "errors": ["Prompt is too long"]},
+    'other-case': {
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "PROMPT IS TOO LONG"},
+}
+
+# Results that must never be taken for one: another error, no error flag, not a result object
+NON_MATCHING_RESULTS = {
+    'other-error': {
+        "type": "result", "subtype": "success", "is_error": True,
+        "result": "API Error: 401 authentication_error"},
+    'other-error-in-errors': {
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "errors": ["API Error: 529 overloaded_error"]},
+    'phrase-without-error-flag': {
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "Prompt is too long"},
+    'phrase-but-not-a-result': {
+        "type": "assistant", "subtype": "success", "is_error": True,
+        "result": "Prompt is too long"},
+}
+
+
+def run_audit():
+    """Run one audit of SimpleClaudeRunner against the mocked subprocess (no real sleeps)."""
+    runner = SimpleClaudeRunner()
+    with patch('pathlib.Path.exists', return_value=True), \
+            patch('claudecode.github_action_audit.time.sleep'):
+        return runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+
+# A marker that must never be echoed from the stdout of a failing Claude Code run. It sits after
+# character 500, the only stretch of stdout the failure message has always carried.
+RAW_MARKER = 'RAW-STDOUT-MARKER-4f1c9e'
+RAW_STDOUT = 'z' * 520 + RAW_MARKER + 'z' * (600 - 520 - len(RAW_MARKER))
+
+
+def run_main_with_claude_calls(tmp_path, claude_calls):
+    """Run main() against a mocked GitHub client and mocked claude subprocesses.
+
+    Returns (exit code, subprocess mock). The version check is the first subprocess call.
+    """
+    client = Mock()
+    client.get_pr_data.return_value = {
+        'number': 42, 'title': 'PR', 'body': 'Body', 'user': 'dev',
+        'head': {'ref': 'branch', 'sha': 'a' * 40, 'repo': {'full_name': 'owner/repo'}},
+        'base': {'ref': 'main', 'sha': 'b' * 40},
+        'files': [{'filename': 'src/a.py', 'status': 'modified', 'additions': 1,
+                   'deletions': 0, 'changes': 1, 'patch': ''}],
+        'additions': 1, 'deletions': 0, 'changed_files': 1,
+    }
+    client.get_pr_diff.return_value = 'diff --git a/src/a.py b/src/a.py\n+x = 1\n'
+    client._is_excluded.return_value = False
+    version = Mock(returncode=0, stdout='2.1.285 (Claude Code)', stderr='')
+    env = {
+        'GITHUB_REPOSITORY': 'owner/repo',
+        'PR_NUMBER': '42',
+        'GITHUB_TOKEN': 'test-token',
+        'ANTHROPIC_API_KEY': 'sk-ant-test-key',
+        'ENABLE_CLAUDE_FILTERING': 'false',
+        'REPO_PATH': str(tmp_path),
+    }
+    with patch('claudecode.github_action_audit.GitHubActionClient', return_value=client), \
+            patch('subprocess.run', side_effect=[version] + list(claude_calls)) as mock_run, \
+            patch('claudecode.github_action_audit.time.sleep'), \
+            patch.dict(os.environ, env):
+        for name in ('CLAUDE_TIMEOUT', 'EXCLUDE_DIRECTORIES', 'FALSE_POSITIVE_FILTERING_INSTRUCTIONS',
+                     'CUSTOM_SECURITY_SCAN_INSTRUCTIONS'):
+            os.environ.pop(name, None)
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+    return exc_info.value.code, mock_run
 
 
 class TestSimpleClaudeRunner:
@@ -340,7 +426,209 @@ class TestSimpleClaudeRunner:
         assert success is False
         assert error == "PROMPT_TOO_LONG"
         assert results == {}
-    
+
+    @pytest.mark.parametrize('returncode', [0, 1])
+    @pytest.mark.parametrize('cli_result', list(PROMPT_TOO_LONG_RESULTS.values()), ids=list(PROMPT_TOO_LONG_RESULTS))
+    @patch('subprocess.run')
+    def test_every_prompt_too_long_result_returns_at_once(self, mock_run, cli_result, returncode):
+        """A matching error result is PROMPT_TOO_LONG after one call, whatever the exit code."""
+        mock_run.return_value = Mock(returncode=returncode, stdout=json.dumps(cli_result), stderr='')
+
+        success, error, results = run_audit()
+
+        assert (success, error, results) == (False, "PROMPT_TOO_LONG", {})
+        assert mock_run.call_count == 1  # no exit-code retry, no error_during_execution retry
+
+    @pytest.mark.parametrize('returncode', [0, 1])
+    @pytest.mark.parametrize('cli_result', list(NON_MATCHING_RESULTS.values()), ids=list(NON_MATCHING_RESULTS))
+    @patch('subprocess.run')
+    def test_non_matching_result_never_yields_a_successful_scan(self, mock_run, cli_result, returncode):
+        """Every other error stays a failed audit; a non-error result keeps its existing handling."""
+        mock_run.return_value = Mock(returncode=returncode, stdout=json.dumps(cli_result), stderr='')
+
+        success, error, results = run_audit()
+
+        assert error != "PROMPT_TOO_LONG"
+        if returncode != 0:
+            # a failing exit code is retried three times and then fails, as before
+            assert (success, results) == (False, {})
+            assert error.startswith(f"Claude Code execution failed with return code {returncode}")
+            assert mock_run.call_count == 3
+        elif cli_result['type'] == 'result' and cli_result['is_error'] is True:
+            assert (success, results) == (False, {})
+            assert error.startswith("Claude Code reported an error")
+        else:
+            # not an error result: findings extraction finds nothing, and the audit is not complete
+            assert success is True
+            assert results['findings'] == []
+            assert results['analysis_summary']['review_completed'] is False
+
+    @pytest.mark.parametrize('cli_result, expected', [
+        # matching: type result, is_error true, the phrase in `result` or in an entry of `errors`
+        ({'type': 'result', 'is_error': True, 'result': 'Prompt is too long'}, True),
+        ({'type': 'result', 'is_error': True, 'result': 'prompt is TOO long'}, True),
+        ({'type': 'result', 'is_error': True, 'result': 'Prompt is too long · cannot be compacted'}, True),
+        ({'type': 'result', 'is_error': True, 'result': 'Error: the prompt is too long for this model'}, True),
+        ({'type': 'result', 'is_error': True, 'errors': ['Prompt is too long']}, True),
+        ({'type': 'result', 'is_error': True, 'errors': ['other', 'PROMPT IS TOO LONG']}, True),
+        ({'type': 'result', 'is_error': True, 'errors': [None, 7, 'Prompt is too long']}, True),
+        ({'type': 'result', 'is_error': True, 'result': 5, 'errors': ['Prompt is too long']}, True),
+        ({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True, 'result': 'Prompt is too long'}, True),
+        # not matching
+        ({'type': 'result', 'is_error': False, 'result': 'Prompt is too long'}, False),
+        ({'type': 'result', 'result': 'Prompt is too long'}, False),
+        ({'type': 'result', 'is_error': 'true', 'result': 'Prompt is too long'}, False),
+        ({'type': 'assistant', 'is_error': True, 'result': 'Prompt is too long'}, False),
+        ({'is_error': True, 'result': 'Prompt is too long'}, False),
+        ({'type': 'result', 'is_error': True, 'result': 'API Error: 401 authentication_error'}, False),
+        ({'type': 'result', 'is_error': True, 'result': 'Prompt is long'}, False),
+        ({'type': 'result', 'is_error': True}, False),
+        ({'type': 'result', 'is_error': True, 'result': 5}, False),
+        ({'type': 'result', 'is_error': True, 'result': ['Prompt is too long']}, False),
+        ({'type': 'result', 'is_error': True, 'errors': 'Prompt is too long'}, False),
+        ({'type': 'result', 'is_error': True, 'errors': [None, 7, ['Prompt is too long'], {'m': 'Prompt is too long'}]}, False),
+        ({'type': 'result', 'is_error': True, 'errors': []}, False),
+        (['Prompt is too long'], False),
+        ('Prompt is too long', False),
+        (None, False),
+    ])
+    def test_is_prompt_too_long_rule(self, cli_result, expected):
+        """The one detection rule: type result, is_error true, the phrase in result or errors."""
+        assert _is_prompt_too_long(cli_result) is expected
+
+    @patch('subprocess.run')
+    def test_prompt_too_long_is_read_from_stdout_after_a_failing_exit_code(self, mock_run):
+        """The failing exit code alone is retried; the same code with a readable result is not."""
+        mock_run.side_effect = [
+            Mock(returncode=1, stdout='', stderr='Temporary error'),
+            Mock(returncode=1, stdout=json.dumps(PROMPT_TOO_LONG_RESULTS['text-with-detail']), stderr='')
+        ]
+
+        success, error, results = run_audit()
+
+        assert (success, error, results) == (False, "PROMPT_TOO_LONG", {})
+        assert mock_run.call_count == 2
+
+    @pytest.mark.parametrize('stdout', [
+        'plain text, not JSON',
+        '',
+        '{"type": "result", "is_error": tr',   # cut off
+        '"Prompt is too long"',                 # valid JSON, but a string
+        '["Prompt is too long"]',               # valid JSON, but a list
+        'null',
+        '42',
+    ], ids=['text', 'empty', 'truncated', 'json-string', 'json-list', 'json-null', 'json-number'])
+    @patch('subprocess.run')
+    def test_failing_exit_without_a_result_object_is_retried_then_fails(self, mock_run, stdout):
+        """Strictly parsed stdout that is not a result object is "no valid result": retry, then fail."""
+        mock_run.return_value = Mock(returncode=1, stdout=stdout, stderr='')
+
+        success, error, results = run_audit()
+
+        assert (success, results) == (False, {})
+        assert error.startswith("Claude Code execution failed with return code 1")
+        assert mock_run.call_count == 3
+
+    @patch('subprocess.run')
+    def test_failing_exit_never_logs_or_returns_the_raw_stdout(self, mock_run, caplog, capsys):
+        """Exit 1 with non-JSON stdout: the text after character 500 appears in no log, no error."""
+        assert len(RAW_STDOUT) == 600 and RAW_STDOUT.index(RAW_MARKER) > 500
+        mock_run.return_value = Mock(returncode=1, stdout=RAW_STDOUT, stderr='')
+
+        with caplog.at_level(logging.DEBUG):
+            success, error, results = run_audit()
+
+        captured = capsys.readouterr()
+        assert (success, results) == (False, {})
+        assert error.startswith("Claude Code execution failed with return code 1")
+        assert mock_run.call_count == 3  # retried as before
+        assert RAW_MARKER not in error
+        assert RAW_MARKER not in caplog.text
+        assert RAW_MARKER not in captured.err
+        assert RAW_MARKER not in captured.out
+        assert 'Raw output' not in caplog.text and 'Raw output' not in captured.err
+
+    @patch('subprocess.run')
+    def test_failing_exit_keeps_one_evidence_record_per_attempt_without_the_stdout(self, mock_run, capsys):
+        """The evidence line is still written for every attempt; it never carries the stdout."""
+        mock_run.return_value = Mock(returncode=1, stdout=RAW_STDOUT, stderr='')
+        runner = SimpleClaudeRunner()
+
+        with patch('pathlib.Path.exists', return_value=True), \
+                patch('claudecode.github_action_audit.time.sleep'):
+            runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+        attempts = runner.scan_evidence()['attempts']
+        assert [entry['attempt'] for entry in attempts] == [1, 2, 3]
+        assert all(entry['exit'] == 1 for entry in attempts)
+        assert RAW_MARKER not in capsys.readouterr().err
+
+    @patch('subprocess.run')
+    def test_failing_exit_prompt_too_long_is_recorded_in_the_evidence(self, mock_run):
+        """A strictly parsed prompt-too-long result on a failing exit is evidence of that attempt."""
+        mock_run.return_value = Mock(
+            returncode=1, stdout=json.dumps(PROMPT_TOO_LONG_RESULTS['exact-text']), stderr='')
+        runner = SimpleClaudeRunner()
+
+        with patch('pathlib.Path.exists', return_value=True):
+            result = runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+        assert result == (False, "PROMPT_TOO_LONG", {})
+        attempts = runner.scan_evidence()['attempts']
+        assert len(attempts) == 1
+        assert attempts[0]['exit'] == 1 and attempts[0]['type'] == 'result' and attempts[0]['is_error'] is True
+
+    EMBEDDED_PROMPT_TOO_LONG = {
+        'text-around-object': 'Claude Code failed: ' + json.dumps(PROMPT_TOO_LONG_RESULTS['exact-text']) + ' (end)',
+        'fenced-block': 'output:\n```json\n' + json.dumps(PROMPT_TOO_LONG_RESULTS['exact-text']) + '\n```\n',
+    }
+
+    @pytest.mark.parametrize('stdout', list(EMBEDDED_PROMPT_TOO_LONG.values()), ids=list(EMBEDDED_PROMPT_TOO_LONG))
+    @patch('subprocess.run')
+    def test_failing_exit_does_not_extract_a_result_from_surrounding_text(self, mock_run, stdout):
+        """Exit 1: only stdout that is itself the JSON result counts. No fallback extraction.
+
+        The same stdout with exit code 0 keeps today's behaviour (see the next test).
+        """
+        mock_run.return_value = Mock(returncode=1, stdout=stdout, stderr='')
+
+        success, error, results = run_audit()
+
+        assert (success, results) == (False, {})
+        assert error != "PROMPT_TOO_LONG"
+        assert error.startswith("Claude Code execution failed with return code 1")
+        assert mock_run.call_count == 3
+
+    @pytest.mark.parametrize('stdout', list(EMBEDDED_PROMPT_TOO_LONG.values()), ids=list(EMBEDDED_PROMPT_TOO_LONG))
+    @patch('subprocess.run')
+    def test_exit_zero_still_extracts_a_result_from_surrounding_text(self, mock_run, stdout):
+        """Exit 0 is unchanged: the parser's fallback extraction finds the embedded result."""
+        mock_run.return_value = Mock(returncode=0, stdout=stdout, stderr='')
+
+        success, error, results = run_audit()
+
+        assert (success, error, results) == (False, "PROMPT_TOO_LONG", {})
+        assert mock_run.call_count == 1
+
+    def test_run_level_failing_exit_never_prints_the_raw_stdout(self, tmp_path, caplog, capsys):
+        """main(): a failing Claude Code run with non-JSON stdout ends in an error, without the stdout."""
+        failing = Mock(returncode=1, stdout=RAW_STDOUT, stderr='')
+
+        with caplog.at_level(logging.DEBUG):
+            code, mock_run = run_main_with_claude_calls(tmp_path, [failing, failing, failing])
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert code == 1  # EXIT_GENERAL_ERROR
+        assert output['error'].startswith('Security audit failed: Claude Code execution failed with return code 1')
+        assert 'findings' not in output
+        assert mock_run.call_count == 4  # version check + three attempts
+        assert len(output['scan_evidence']['attempts']) == 3
+        assert RAW_MARKER not in captured.out  # the results JSON
+        assert RAW_MARKER not in captured.err
+        assert RAW_MARKER not in caplog.text
+        assert 'Raw output' not in caplog.text and 'Raw output' not in captured.err
+
     @patch('subprocess.run')
     def test_run_security_audit_timeout(self, mock_run):
         """Test timeout handling."""
