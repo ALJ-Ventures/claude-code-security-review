@@ -47,7 +47,7 @@ class TestFullWorkflowIntegration:
             },
             'additions': 250,
             'deletions': 50,
-            'changed_files': 8
+            'changed_files': 2
         }
         
         files_response = Mock()
@@ -236,7 +236,7 @@ index 8901234..5678901 100644
             'base': {'ref': 'main', 'sha': 'main456'},
             'additions': 100,
             'deletions': 80,
-            'changed_files': 5
+            'changed_files': 0
         }
         
         files_response = Mock()
@@ -323,7 +323,7 @@ index 8901234..5678901 100644
             'base': {'ref': 'main', 'sha': 'main789'},
             'additions': 50,
             'deletions': 10,
-            'changed_files': 2
+            'changed_files': 1
         }
         
         files_response = Mock()

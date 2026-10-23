@@ -81,9 +81,20 @@ class GitHubActionClient:
         response.raise_for_status()
         pr_data = response.json()
         
+        # changed_files is what the file list is checked against: without a valid count the
+        # completeness cannot be checked, so the scan fails closed.
+        changed_files = pr_data.get('changed_files')
+        valid_count = isinstance(changed_files, int) and not isinstance(changed_files, bool)
+        if not valid_count or changed_files < 0:
+            raise AuditError(
+                f"PR metadata has no valid changed_files count (a non-negative integer, got "
+                f"{type(changed_files).__name__}); the file list completeness cannot be checked"
+            )
+        
         # Get every page of the PR file list. A page that fails raises out of this method: a
         # partial list must never pass as the complete one.
         files_data = []
+        cap_note = ''
         for page in range(1, self.FILES_MAX_PAGES + 1):
             files_url = (
                 f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files"
@@ -97,14 +108,16 @@ class GitHubActionClient:
                 break
         else:
             # No short page: page FILES_MAX_PAGES was full, so the list stopped at the API cap, not
-            # at the end of the PR. A PR with more changed files than the cap has files this scan
-            # would never see, and a partial list must not pass as complete.
-            if pr_data['changed_files'] > len(files_data):
-                raise AuditError(
-                    f"PR has {pr_data['changed_files']} changed files, but the GitHub API lists at most "
-                    f"{len(files_data)} (cap of {self.FILES_MAX_PAGES} pages of {self.FILES_PER_PAGE}); "
-                    f"the file list would be incomplete"
-                )
+            # at the end of the PR.
+            cap_note = f" (cap of {self.FILES_MAX_PAGES} pages of {self.FILES_PER_PAGE})"
+        
+        # Q4, checked after every exit of the loop (short page, empty page, page cap): the files
+        # the API listed, counted before exclusion, must reach changed_files; a partial list fails.
+        if len(files_data) < changed_files:
+            raise AuditError(
+                f"PR has {changed_files} changed files, but the GitHub API listed {len(files_data)}"
+                f"{cap_note}; the file list would be incomplete"
+            )
         
         return {
             'number': pr_data['number'],

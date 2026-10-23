@@ -6,11 +6,13 @@ Unit tests for main function and full workflow.
 import pytest
 import json
 import os
+import re
 import requests
 from unittest.mock import Mock, patch
 from pathlib import Path
 
-from claudecode.github_action_audit import main
+from claudecode import result_gate
+from claudecode.github_action_audit import SimpleClaudeRunner, main
 
 
 # action.yml exports CLAUDE_TIMEOUT; an ambient value must not change what these tests run with.
@@ -337,7 +339,7 @@ class TestMainFunction:
             'base': {'ref': 'main', 'sha': 'def456'},
             'additions': 1010,
             'deletions': 0,
-            'changed_files': 101
+            'changed_files': 100
         }
         page_1 = Mock()
         page_1.json.return_value = [
@@ -470,7 +472,94 @@ class TestMainFunction:
             assert 'findings' not in output
             assert f'{base}/files?per_page=100&page=31' not in requested
             mock_runner.run_security_audit.assert_not_called()
-    
+
+    @pytest.mark.parametrize('page_sizes', [[0], [93], [100, 0]],
+                             ids=['empty-first-page', 'short-page-before-the-end', 'empty-second-page'])
+    @patch('requests.get')
+    def test_main_file_list_shorter_than_changed_files_fails_before_the_scan(self, mock_get, page_sizes,
+                                                                             tmp_path, capsys):
+        """Q4: a file list shorter than changed_files (194) ends the run before any Claude call, and
+        the result gate reads the output as a failed scan, never as 0 findings."""
+        base = 'https://api.github.com/repos/owner/repo/pulls/123'
+        pr_response = Mock()
+        pr_response.json.return_value = {
+            'number': 123,
+            'title': 'Partial list PR',
+            'body': '',
+            'user': {'login': 'testuser'},
+            'created_at': '2024-01-01T00:00:00Z',
+            'updated_at': '2024-01-01T01:00:00Z',
+            'state': 'open',
+            'head': {'ref': 'feature', 'sha': 'abc123', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def456'},
+            'additions': 1940,
+            'deletions': 0,
+            'changed_files': 194
+        }
+        responses = {base: pr_response}
+        start = 0
+        for number, size in enumerate(page_sizes, start=1):
+            page = Mock()
+            page.json.return_value = [
+                {
+                    'filename': f'file{i}.py',
+                    'status': 'added',
+                    'additions': 10,
+                    'deletions': 0,
+                    'changes': 10,
+                    'patch': '@@ -0,0 +1 @@\n+x'
+                }
+                for i in range(start, start + size)
+            ]
+            responses[f'{base}/files?per_page=100&page={number}'] = page
+            start += size
+        diff_response = Mock()
+        diff_response.text = 'diff --git a/file0.py b/file0.py\n+x\n'
+
+        def route(url, headers=None, **kwargs):
+            if headers and headers.get('Accept') == 'application/vnd.github.diff':
+                return diff_response
+            return responses[url]
+
+        mock_get.side_effect = route
+
+        # Real runner: the availability check is the only subprocess call a correct run makes. The
+        # completed audit result is there so a run that wrongly reaches the scan goes green.
+        version = Mock(returncode=0, stdout='2.1.285 (Claude Code)', stderr='')
+        completed = Mock(returncode=0, stderr='', stdout=json.dumps({'result': json.dumps(
+            {'findings': [], 'analysis_summary': {'review_completed': True}})}))
+        with patch('claudecode.github_action_audit.subprocess.run', side_effect=[version, completed]) as mock_run, \
+                patch.object(SimpleClaudeRunner, 'run_security_audit', autospec=True,
+                             side_effect=SimpleClaudeRunner.run_security_audit) as audit, \
+                patch.dict(os.environ, {
+                    'GITHUB_REPOSITORY': 'owner/repo',
+                    'PR_NUMBER': '123',
+                    'GITHUB_TOKEN': 'test-token',
+                    'ANTHROPIC_API_KEY': 'test-api-key',
+                    'ENABLE_CLAUDE_FILTERING': 'false',
+                    'REPO_PATH': str(tmp_path)
+                }):
+            for name in ('EXCLUDE_DIRECTORIES', 'FALSE_POSITIVE_FILTERING_INSTRUCTIONS',
+                         'CUSTOM_SECURITY_SCAN_INSTRUCTIONS'):
+                os.environ.pop(name, None)
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        code = exc_info.value.code
+        output = json.loads(capsys.readouterr().out)
+        assert code == 1  # EXIT_GENERAL_ERROR
+        assert output['error'].startswith('Failed to fetch PR data')
+        assert sorted(int(n) for n in re.findall(r'\d+', output['error'])) == sorted([194, sum(page_sizes)])
+        assert 'scan_evidence' in output
+        assert output['scan_evidence'] == {'attempts': []}  # no Claude Code attempt was made
+        assert 'findings' not in output
+        audit.assert_not_called()
+        assert [call.args[0] for call in mock_run.call_args_list] == [['claude', '--version']]
+
+        results_file = tmp_path / 'claudecode-results.json'
+        results_file.write_text(json.dumps(output), encoding='utf-8')
+        assert result_gate.evaluate(str(results_file), str(code)) == (False, 'scan reported an error')
+
     @patch('pathlib.Path.cwd')
     @patch('claudecode.github_action_audit.get_security_audit_prompt')
     @patch('claudecode.github_action_audit.FindingsFilter')

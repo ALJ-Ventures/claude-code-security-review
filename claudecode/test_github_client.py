@@ -5,10 +5,11 @@ Unit tests for GitHubActionClient.
 
 import pytest
 import os
+import re
 import requests
 from unittest.mock import Mock, patch
 
-from claudecode.github_action_audit import GitHubActionClient
+from claudecode.github_action_audit import AuditError, GitHubActionClient
 
 
 FILES_URL = 'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100&page={page}'
@@ -59,6 +60,26 @@ def make_files_page(entries):
 def requested_urls(mock_get):
     """URLs of every requests.get call, in call order."""
     return [call.args[0] for call in mock_get.call_args_list]
+
+
+def make_files_pages(page_sizes, prefix=''):
+    """One mocked file page per size, with consecutively numbered files across the pages."""
+    pages, start = [], 0
+    for size in page_sizes:
+        entries = make_file_entries(start, size)
+        for entry in entries:
+            entry['filename'] = prefix + entry['filename']
+        pages.append(make_files_page(entries))
+        start += size
+    return pages
+
+
+# Every way the page loop can end on a list shorter than changed_files (194): (page sizes, files listed)
+SHORT_LIST_CASES = {
+    'empty-first-page': ([0], 0),
+    'short-page-before-the-end': ([93], 93),
+    'full-first-page-then-empty-second-page': ([100, 0], 100),
+}
 
 
 class TestGitHubActionClient:
@@ -112,7 +133,7 @@ class TestGitHubActionClient:
             },
             'additions': 50,
             'deletions': 10,
-            'changed_files': 3
+            'changed_files': 2
         }
         
         files_response = Mock()
@@ -185,7 +206,7 @@ class TestGitHubActionClient:
             },
             'additions': 50,
             'deletions': 10,
-            'changed_files': 3
+            'changed_files': 0
         }
         
         files_response = Mock()
@@ -475,9 +496,9 @@ class TestGitHubAPIIntegration:
         assert result['changed_files'] == 3000
 
     @patch('requests.get')
-    def test_short_page_below_changed_files_does_not_fail(self, mock_get):
-        """The completeness check applies only when the 3,000-file cap was reached: a short last
-        page ends the list, whatever changed_files says."""
+    def test_short_last_page_below_changed_files_fails(self, mock_get):
+        """The completeness check is not limited to the 3,000-file cap: a short last page that
+        leaves the list below changed_files fails closed instead of ending the list."""
         mock_get.side_effect = [
             make_pr_response(changed_files=500),
             make_files_page(make_file_entries(0, 100)),
@@ -486,10 +507,11 @@ class TestGitHubAPIIntegration:
 
         with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
             client = GitHubActionClient()
-            result = client.get_pr_data('owner/repo', 123)
+            with pytest.raises(AuditError) as exc_info:
+                client.get_pr_data('owner/repo', 123)
 
-        assert len(result['files']) == 120
-        assert result['changed_files'] == 500
+        assert sorted(int(n) for n in re.findall(r'\d+', str(exc_info.value))) == [120, 500]
+        assert requested_urls(mock_get)[1:] == [FILES_URL.format(page=1), FILES_URL.format(page=2)]
 
     @patch('requests.get')
     def test_excluded_directories_apply_to_the_collected_list(self, mock_get):
@@ -515,7 +537,92 @@ class TestGitHubAPIIntegration:
         }
 
 
-TIMEOUT_ERRORS = [requests.exceptions.Timeout, requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout]
+class TestFileListCompleteness:
+    """Q4: after every exit of the page loop the files the API listed, counted before directory
+    exclusion, are compared with changed_files. A shorter list fails closed; a longer one passes."""
+
+    @pytest.mark.parametrize('page_sizes, listed', list(SHORT_LIST_CASES.values()), ids=list(SHORT_LIST_CASES))
+    @patch('requests.get')
+    def test_list_shorter_than_changed_files_raises(self, mock_get, page_sizes, listed):
+        """0, 93 or 100 of 194 files: AuditError naming both counts, and no file names."""
+        mock_get.side_effect = [make_pr_response(changed_files=194)] + make_files_pages(page_sizes)
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(AuditError) as exc_info:
+                client.get_pr_data('owner/repo', 123)
+
+        message = str(exc_info.value)
+        assert sorted(int(n) for n in re.findall(r'\d+', message)) == sorted([194, listed])
+        assert 'file0.py' not in message
+        assert requested_urls(mock_get)[1:] == [FILES_URL.format(page=n) for n in range(1, len(page_sizes) + 1)]
+
+    @patch('requests.get')
+    def test_complete_list_over_two_pages_passes(self, mock_get):
+        """194 = 100 + 94: the list is complete, every file is returned."""
+        mock_get.side_effect = [make_pr_response(changed_files=194)] + make_files_pages([100, 94])
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            result = GitHubActionClient().get_pr_data('owner/repo', 123)
+
+        assert [f['filename'] for f in result['files']] == [f'file{i}.py' for i in range(194)]
+        assert result['changed_files'] == 194
+
+    @patch('requests.get')
+    def test_complete_list_with_every_file_excluded_returns_no_files(self, mock_get):
+        """The check counts the listed files, not those left after exclusion: a complete list whose
+        files are all excluded gives an empty `files` and no error."""
+        mock_get.side_effect = [make_pr_response(changed_files=194)] + make_files_pages([100, 94], prefix='vendor/')
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token', 'EXCLUDE_DIRECTORIES': 'vendor'}):
+            result = GitHubActionClient().get_pr_data('owner/repo', 123)
+
+        assert result['files'] == []
+        assert result['changed_files'] == 194
+
+    @patch('requests.get')
+    def test_empty_list_passes_when_changed_files_is_0(self, mock_get):
+        """An empty first page is complete when the PR reports 0 changed files: no blanket empty guard."""
+        mock_get.side_effect = [make_pr_response(changed_files=0)] + make_files_pages([0])
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            result = GitHubActionClient().get_pr_data('owner/repo', 123)
+
+        assert result['files'] == []
+        assert result['changed_files'] == 0
+
+    @pytest.mark.parametrize('page_sizes', [[5], [100, 0]], ids=['short-page', 'full-page-then-empty-page'])
+    @patch('requests.get')
+    def test_list_longer_than_changed_files_passes(self, mock_get, page_sizes):
+        """More listed files than changed_files changes nothing: every listed file is returned."""
+        mock_get.side_effect = [make_pr_response(changed_files=3)] + make_files_pages(page_sizes)
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            result = GitHubActionClient().get_pr_data('owner/repo', 123)
+
+        assert len(result['files']) == sum(page_sizes)
+        assert result['changed_files'] == 3
+
+    @pytest.mark.parametrize('changed_files', ['missing', None, -1, '194', 194.0, True],
+                             ids=['missing', 'none', 'negative', 'string', 'float', 'bool'])
+    @patch('requests.get')
+    def test_missing_or_invalid_changed_files_raises(self, mock_get, changed_files):
+        """Without a non-negative integer changed_files the completeness cannot be checked: fail closed."""
+        pr_response = make_pr_response(changed_files=3)
+        metadata = pr_response.json.return_value
+        if changed_files == 'missing':
+            del metadata['changed_files']
+        else:
+            metadata['changed_files'] = changed_files
+        mock_get.side_effect = [pr_response] + make_files_pages([3])
+
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            client = GitHubActionClient()
+            with pytest.raises(AuditError, match='changed_files'):
+                client.get_pr_data('owner/repo', 123)
+
+
+TIMEOUT_ERRORS =[requests.exceptions.Timeout, requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout]
 TIMEOUT_IDS = ['timeout', 'connect-timeout', 'read-timeout']
 
 
