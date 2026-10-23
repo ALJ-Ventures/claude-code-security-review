@@ -509,7 +509,8 @@ class SimpleClaudeRunner:
                     # over-long prompt together with a failing exit code. That is not a crash to
                     # repeat three times; main() runs the attempt without the diff on it instead.
                     # On a failing exit only a strictly parsed result object counts: no fallback
-                    # extraction, and the raw stdout is never logged.
+                    # extraction, and this parser logs no raw stdout; the final error message still
+                    # carries the first 500 characters (residual risk, #382).
                     if result.returncode == 0:
                         success, parsed_result = parse_json_with_fallbacks(result.stdout, "Claude Code output")
                     else:
